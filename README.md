@@ -57,7 +57,7 @@ brew install libomp
 Ganache GUI를 열고 **Quickstart** 클릭합니다.
 상단에 `RPC SERVER: HTTP://127.0.0.1:7545`가 표시되면 준비 완료입니다.
 
-(CLI 버전 사용 시: `ganache` 명령어 실행)
+(CLI 버전 사용 시: `ganache -p 7545` 명령어 실행)
 
 ### Step 2: A파트 — 블록 읽기
 
