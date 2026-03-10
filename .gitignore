@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+blocks_output.json
+C_smart_contract/deploy_info.json
+C_smart_contract/abi/
+.claude/

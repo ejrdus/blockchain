@@ -1,0 +1,8 @@
+web3
+py-solc-x
+fastapi
+uvicorn
+joblib
+pandas
+scikit-learn
+lightgbm
