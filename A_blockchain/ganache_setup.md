@@ -3,7 +3,7 @@
 1. 가나슈(Ganache)를 실행합니다.
 2. 메인 화면에서 `Quickstart` 버튼을 클릭하여 로컬 체인을 생성합니다.
 3. 상단 메뉴의 **RPC SERVER** 주소가 `http://127.0.0.1:7545`인지 확인합니다.
-   (만약 포트가 다르다면 `my_config.py`의 `GANACHE_RPC_URL`을 수정해 주세요.)
+   (만약 포트가 다르다면 `config.py`의 `GANACHE_RPC_URL`을 수정해 주세요.)
 4. 터미널에서 `pip install web3` 패키지를 설치합니다.
 5. `python read_block.py`를 실행하여 블록의 해시와 넌스 값이 잘 나오는지 확인합니다.
 
@@ -30,7 +30,7 @@ except ImportError:
     print(f"✅ web3 설치 완료 (버전: {web3.__version__})")
 
 # 2. config 로드
-from my_config import GANACHE_RPC_URL, CHAIN_ID
+from config import GANACHE_RPC_URL, CHAIN_ID
 print(f"✅ RPC URL : {GANACHE_RPC_URL}")
 
 # 3. Ganache 연결 확인
