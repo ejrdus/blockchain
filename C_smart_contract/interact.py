@@ -1,18 +1,18 @@
 """
-C파트 — 스마트 컨트랙트 호출 / 토큰 전송 스크립트
-deploy.py로 배포된 Token + FraudAudit 컨트랙트와 상호작용한다.
+C파트 — 에스크로 기반 토큰 전송 스크립트
 
-[2주차] FDS 서버 연동:
-  송금 시도 → FDS 서버에 거래 특성값 전송 → 사기 확률 리턴
-  → 정상이면 토큰 전송 / 사기면 차단
-  → AI 위험도 점수를 해시화하여 FraudAudit 컨트랙트에 기록 (ZKP 간략화)
+흐름:
+  1. 송신자가 escrowDeposit() → 토큰을 컨트랙트에 잠금
+  2. A파트로 수신자 지갑 분석 → B파트 AI 판별 (100% AI)
+  3. 정상 → escrowApprove() : 수신자에게 전송
+     사기  → escrowReject()  : 송신자에게 반환
+
+v2: Ganache 맞춤 모델로 100% AI 판별 (규칙 엔진 제거)
 """
 
-import hashlib
 import json
 import os
 import sys
-import time
 
 import requests
 from web3 import Web3
@@ -21,18 +21,18 @@ from web3 import Web3
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from config import GANACHE_URL, FDS_SERVER_URL, FDS_ENDPOINT
 
+# A파트 analyze_address import
+sys.path.append(os.path.join(os.path.dirname(__file__), "../A_blockchain"))
+from read_block import analyze_address
+
+# 규칙 기반 사기 탐지 엔진 (패턴 이름 참조용으로 유지)
+from rule_engine import rule_based_score
+
 BASE_DIR = os.path.dirname(__file__)
 
-# ── FDS 서버 임계값 (이 확률 이상이면 사기로 차단) ──
-# FDS 서버가 리턴하는 threshold를 사용하되, 연결 실패 시 기본값
-DEFAULT_THRESHOLD = 32.0  # percent
 
-
-# ═══════════════════════════════════════════════════════════════
-#  컨트랙트 로딩
-# ═══════════════════════════════════════════════════════════════
-def load_contracts(w3):
-    """배포 정보와 ABI를 읽어 Token, FraudAudit 컨트랙트 객체를 반환한다."""
+def load_contract(w3):
+    """배포 정보와 ABI를 읽어 컨트랙트 객체를 반환한다."""
     deploy_info_path = os.path.join(BASE_DIR, "deploy_info.json")
     if not os.path.exists(deploy_info_path):
         print("[!] deploy_info.json이 없습니다. 먼저 deploy.py를 실행하세요.")
@@ -41,450 +41,343 @@ def load_contracts(w3):
     with open(deploy_info_path, "r") as f:
         deploy_info = json.load(f)
 
-    # Token ABI & 컨트랙트
-    token_abi_path = os.path.join(BASE_DIR, "abi", "Token.json")
-    with open(token_abi_path, "r") as f:
-        token_abi = json.load(f)
+    abi_path = os.path.join(BASE_DIR, "abi", "Token.json")
+    with open(abi_path, "r") as f:
+        abi = json.load(f)
 
-    token_address = deploy_info.get("token_address", deploy_info.get("contract_address"))
-    token_contract = w3.eth.contract(address=token_address, abi=token_abi)
-
-    # FraudAudit ABI & 컨트랙트 (2주차)
-    audit_abi_path = os.path.join(BASE_DIR, "abi", "FraudAudit.json")
-    if os.path.exists(audit_abi_path) and "audit_address" in deploy_info:
-        with open(audit_abi_path, "r") as f:
-            audit_abi = json.load(f)
-        audit_contract = w3.eth.contract(address=deploy_info["audit_address"], abi=audit_abi)
-    else:
-        audit_contract = None
-        print("[!] FraudAudit 컨트랙트를 찾을 수 없습니다. deploy.py를 다시 실행하세요.")
-
-    return token_contract, audit_contract, deploy_info
+    contract_address = deploy_info["contract_address"]
+    contract = w3.eth.contract(address=contract_address, abi=abi)
+    return contract, deploy_info
 
 
-# ═══════════════════════════════════════════════════════════════
-#  토큰 정보 / 잔액 조회
-# ═══════════════════════════════════════════════════════════════
 def get_token_info(contract):
     """토큰 기본 정보를 조회한다."""
-    name = contract.functions.name().call()
-    symbol = contract.functions.symbol().call()
-    decimals = contract.functions.decimals().call()
+    name         = contract.functions.name().call()
+    symbol       = contract.functions.symbol().call()
+    decimals     = contract.functions.decimals().call()
     total_supply = contract.functions.totalSupply().call()
 
-    print("=" * 60)
+    print("=" * 55)
     print(f"  토큰 이름   : {name}")
     print(f"  심볼       : {symbol}")
     print(f"  소수점     : {decimals}")
     print(f"  총 발행량  : {total_supply / (10 ** decimals):,.0f} {symbol}")
-    print("=" * 60)
+    print("=" * 55)
 
 
-def check_balance(contract, address):
+def check_balance(contract, address, label=""):
     """특정 주소의 토큰 잔액을 조회한다."""
     decimals = contract.functions.decimals().call()
-    symbol = contract.functions.symbol().call()
-    balance = contract.functions.balanceOf(address).call()
+    symbol   = contract.functions.symbol().call()
+    balance  = contract.functions.balanceOf(address).call()
     readable = balance / (10 ** decimals)
-    print(f"  [{address[:10]}...] 잔액: {readable:,.2f} {symbol}")
+    tag = f"[{label}] " if label else ""
+    print(f"  {tag}{address[:10]}...  잔액: {readable:,.2f} {symbol}")
     return balance
 
 
-# ═══════════════════════════════════════════════════════════════
-#  [2주차] FDS 서버 연동
-# ═══════════════════════════════════════════════════════════════
-def build_features(w3, sender, receiver, amount, tx_history=None):
+def check_receiver_history(w3, address) -> dict:
     """
-    송금 시도에 대한 Feature Dict를 구성한다.
-    실제 운영 환경에서는 블록체인 상의 과거 거래 이력을 분석하여
-    각 피처를 계산하지만, 데모 환경에서는 기본값 + 시뮬레이션 값을 사용한다.
+    수신자의 거래 이력을 확인한다.
+    이력이 없거나 부족하면 경고 정보를 반환한다.
 
-    tx_history가 제공되면 해당 값들을 사용한다.
+    반환:
+      {
+        "has_history": bool,       # 거래 이력 존재 여부
+        "sent_count": int,         # 송신 건수
+        "recv_count": int,         # 수신 건수
+        "warning_level": str,      # "none" | "caution" | "danger"
+        "warning_message": str,    # 경고 메시지
+      }
     """
-    if tx_history:
-        return tx_history
+    target = w3.to_checksum_address(address)
+    sent_count = 0
+    recv_count = 0
 
-    # 데모용 기본 피처 (Ganache 로컬 환경)
-    return {
-        "Avg min between sent tnx": 0,
-        "Avg min between received tnx": 0,
-        "Time Diff between first and last (Mins)": 0,
-        "Sent tnx": 0,
-        "Received Tnx": 0,
-        "Number of Created Contracts": 0,
-        "Unique Received From Addresses": 0,
-        "Unique Sent To Addresses": 0,
-        "min value received": 0,
-        "max value received": 0,
-        "avg val received": 0,
-        "min val sent": 0,
-        "max val sent": 0,
-        "avg val sent": 0,
-        "min value sent to contract": 0,
-        "max val sent to contract": 0,
-        "avg value sent to contract": 0,
-        "total transactions (including tnx to create contract": 0,
-        "total Ether sent": 0,
-        "total ether received": 0,
-        "total ether sent contracts": 0,
-        "total ether balance": 0,
-        "Total ERC20 tnxs": 0,
-        "ERC20 total Ether received": 0,
-        "ERC20 total ether sent": 0,
-        "ERC20 total Ether sent contract": 0,
-        "ERC20 uniq sent addr": 0,
-        "ERC20 uniq rec addr": 0,
-        "ERC20 uniq rec contract addr": 0,
-        "ERC20 avg time between sent tnx": 0,
-        "ERC20 avg time between rec tnx": 0,
-        "ERC20 avg time between contract tnx": 0,
-        "ERC20 min val rec": 0,
-        "ERC20 max val rec": 0,
-        "ERC20 avg val rec": 0,
-        "ERC20 min val sent": 0,
-        "ERC20 max val sent": 0,
-        "ERC20 avg val sent": 0,
-        "ERC20 min val sent contract": 0,
-        "ERC20 max val sent contract": 0,
-        "ERC20 avg val sent contract": 0,
-        "has_erc20_activity": 0,
-        "sent_received_ratio": 0,
-        "unique_counterparty_ratio": 0,
+    latest = w3.eth.block_number
+    for num in range(0, latest + 1):
+        block = w3.eth.get_block(num, full_transactions=True)
+        for tx in block.transactions:
+            if tx["from"] == target:
+                sent_count += 1
+            if tx["to"] == target:
+                recv_count += 1
+
+    total = sent_count + recv_count
+
+    if total == 0:
+        return {
+            "has_history": False,
+            "sent_count": 0,
+            "recv_count": 0,
+            "warning_level": "danger",
+            "warning_message": (
+                "⚠️  [경고] 수신자의 거래 이력이 전혀 없습니다!\n"
+                "     이 주소는 신규 생성되었거나 알 수 없는 지갑입니다.\n"
+                "     송금 시 각별한 주의가 필요합니다."
+            ),
+        }
+    elif total <= 2:
+        return {
+            "has_history": True,
+            "sent_count": sent_count,
+            "recv_count": recv_count,
+            "warning_level": "caution",
+            "warning_message": (
+                f"⚠️  [주의] 수신자의 거래 이력이 매우 적습니다. "
+                f"(송신 {sent_count}건 / 수신 {recv_count}건)\n"
+                "     AI 검증 데이터가 부족하여 정확도가 낮을 수 있습니다."
+            ),
+        }
+    else:
+        return {
+            "has_history": True,
+            "sent_count": sent_count,
+            "recv_count": recv_count,
+            "warning_level": "none",
+            "warning_message": "",
+        }
+
+
+def ai_verify(w3, address) -> tuple[bool, float, dict]:
+    """
+    수신자 이력 확인 → A파트 feature 계산 → B파트 AI 판별 (100% AI).
+    반환: (정상 여부, 사기 확률%, 검증 상세 결과 dict)
+    """
+    result_detail = {
+        "receiver": address,
+        "history_check": None,
+        "features": None,
+        "ai_result": None,
+        "final_decision": None,
     }
 
+    # ── Step A: 수신자 거래 이력 확인 ──
+    print(f"\n  [🔍 이력 확인] {address[:10]}... 수신자 거래 이력 조회 중...")
+    history = check_receiver_history(w3, address)
+    result_detail["history_check"] = history
 
-def query_fds(features):
-    """
-    FDS 서버에 거래 특성값을 전송하여 사기 확률을 리턴받는다.
-    POST /predict → {"pred_label": 0/1, "pred_proba": float, "threshold": float}
-    """
-    url = f"{FDS_SERVER_URL}{FDS_ENDPOINT}"
-    payload = {"features": features}
+    if history["warning_level"] != "none":
+        print(f"\n  {history['warning_message']}")
 
+    if history["warning_level"] == "danger":
+        # 이력 전무 → AI 검증 불가, 경고와 함께 보류 처리
+        print("  → 거래 이력 없음: AI 검증 불가. 송신자 확인 필요.")
+        result_detail["final_decision"] = "hold_no_history"
+        return False, -1.0, result_detail
+
+    # ── Step B: A파트 feature 추출 ──
+    print(f"\n  [🤖 AI 검증] {address[:10]}... 지갑 분석 중...")
+    features = analyze_address(w3, address)
+    result_detail["features"] = features
+
+    # ── Step C: B파트 AI 판별 (100% AI) ──
+    ai_proba = -1.0
     try:
-        resp = requests.post(url, json=payload, timeout=5)
-        resp.raise_for_status()
-        result = resp.json()
-        print(f"\n  [FDS] 서버 응답:")
-        print(f"    사기 확률   : {result['pred_proba']:.2f}%")
-        print(f"    임계값      : {result['threshold']}%")
-        print(f"    판정 라벨   : {'🚨 사기' if result['pred_label'] == 1 else '✅ 정상'}")
-        return result
+        res = requests.post(
+            FDS_SERVER_URL + FDS_ENDPOINT,
+            json={"features": features},
+            timeout=10
+        )
+        ai_result = res.json()
+        ai_proba = ai_result["pred_proba"]
+        result_detail["ai_result"] = ai_result
+        print(f"  [AI 모델] 사기 확률: {ai_proba}%")
     except requests.exceptions.ConnectionError:
-        print(f"\n  [FDS] ⚠️  FDS 서버에 연결할 수 없습니다 ({url})")
-        print(f"         B_ai_fds/main.py를 먼저 실행하세요!")
-        print(f"         → 연결 실패 시 거래를 차단합니다 (안전 모드)")
-        return None
-    except Exception as e:
-        print(f"\n  [FDS] ⚠️  FDS 서버 오류: {e}")
-        return None
+        print("  [!] B파트 FDS 서버 미연결 — AI 판별 불가")
+
+    # ── Step D: 패턴 참조 (보조 정보) ──
+    rule_info = rule_based_score(features)
+    result_detail["rule_info"] = rule_info
+
+    if rule_info["detected_patterns"]:
+        print(f"  [참고 패턴] {', '.join(rule_info['detected_patterns'])}")
+
+    # ── Step E: 최종 판별 (100% AI) ──
+    if ai_proba < 0:
+        # AI 서버 미연결 → 규칙 기반 fallback
+        final_score = rule_info["rule_score"]
+        print(f"  [Fallback] 규칙 기반 점수: {final_score}%")
+        is_fraud = final_score >= 40
+    else:
+        final_score = ai_proba
+        threshold_pct = ai_result.get("threshold", 50)
+        is_fraud = ai_proba >= threshold_pct
+        print(f"  [최종 점수] {final_score}% (AI 100%, 임계값 {threshold_pct}%)")
+
+    if history["warning_level"] == "caution":
+        print("  ℹ️  이력 부족으로 정확도가 낮을 수 있음")
+
+    is_safe = not is_fraud
+    result_detail["final_score"] = final_score
+    result_detail["final_decision"] = "approved" if is_safe else "rejected"
+    return is_safe, final_score, result_detail
 
 
-# ═══════════════════════════════════════════════════════════════
-#  [2주차] ZKP 간략화 — 위험도 점수 해시 생성 및 블록 기록
-# ═══════════════════════════════════════════════════════════════
-def compute_score_hash(sender, receiver, amount, fraud_score, timestamp):
+def escrow_send(w3, contract, sender, receiver, amount):
     """
-    AI 위험도 점수 + 거래 정보를 keccak256으로 해시화한다.
-    이 해시를 블록체인에 기록하여 데이터 불변성을 보장한다 (ZKP 간략화).
-    """
-    # 해시 입력: 송신자 + 수신자 + 금액 + 사기확률 + 타임스탬프
-    raw = f"{sender}|{receiver}|{amount}|{fraud_score}|{timestamp}"
-    hash_bytes = Web3.solidity_keccak(["string"], [raw])
-    return hash_bytes
+    에스크로 전체 흐름 실행:
+      1) 수신자 이력 사전 확인 (이력 없으면 경고)
+      2) deposit → 토큰 잠금
+      3) AI 검증 (이력 있을 때만)
+      4) approve or reject or hold
 
-
-def record_audit_on_chain(w3, audit_contract, deployer, sender, receiver, amount, fraud_score, score_hash, blocked):
+    반환: 거래 결과 dict
     """
-    FraudAudit 컨트랙트에 감사 기록을 남긴다.
-    """
-    # fraud_score를 정수로 변환 (예: 87.32% → 8732)
-    score_int = int(fraud_score * 100)
-    # amount를 wei 단위로 변환
-    amount_wei = Web3.to_wei(amount, "ether")
+    decimals   = contract.functions.decimals().call()
+    symbol     = contract.functions.symbol().call()
+    raw_amount = int(amount * (10 ** decimals))
 
-    tx = audit_contract.functions.recordAudit(
-        sender, receiver, amount_wei, score_int, score_hash, blocked
-    ).build_transaction({
-        "from": deployer,
-        "nonce": w3.eth.get_transaction_count(deployer),
-        "gas": 300_000,
+    print(f"\n{'─'*55}")
+    print(f"  송신자 : {sender[:10]}...")
+    print(f"  수신자 : {receiver[:10]}...")
+    print(f"  금액   : {amount:,.2f} {symbol}")
+
+    # ── Step 1: 토큰을 컨트랙트에 예치 ──
+    print("\n  [1단계] 토큰을 컨트랙트에 예치(잠금)...")
+    tx = contract.functions.escrowDeposit(receiver, raw_amount).build_transaction({
+        "from":     sender,
+        "nonce":    w3.eth.get_transaction_count(sender),
+        "gas":      200_000,
         "gasPrice": w3.eth.gas_price,
     })
-
     tx_hash = w3.eth.send_transaction(tx)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
 
-    record_count = audit_contract.functions.getAuditCount().call()
-    print(f"  [Audit] 블록체인 기록 완료!")
-    print(f"    기록 ID    : {record_count - 1}")
-    print(f"    해시       : {score_hash.hex()}")
-    print(f"    차단 여부  : {'차단됨' if blocked else '통과'}")
-    print(f"    TX 해시    : {tx_hash.hex()}")
-    print(f"    블록 번호  : {receipt.blockNumber}")
+    logs   = contract.events.EscrowDeposited().process_receipt(receipt)
+    tx_id  = logs[0]["args"]["txId"]
+    print(f"  ✅ 예치 완료 | EscrowTxId: {tx_id} | Block: {receipt.blockNumber}")
 
-    return receipt
+    # ── Step 2: AI로 수신자 검증 (이력 확인 포함) ──
+    print("\n  [2단계] 수신자 검증 중...")
+    is_safe, proba, detail = ai_verify(w3, receiver)
 
+    # ── Step 3: 결과에 따라 승인 or 거부 or 보류 ──
+    deployer = w3.eth.accounts[0]
+    final_score = detail.get("final_score", proba)
 
-# ═══════════════════════════════════════════════════════════════
-#  [2주차] 통합: FDS 검증 + 토큰 전송 + 감사 기록
-# ═══════════════════════════════════════════════════════════════
-def safe_transfer(w3, token_contract, audit_contract, deployer, sender, receiver, amount, tx_history=None):
-    """
-    FDS 서버와 연동된 안전한 토큰 전송.
-    1) 거래 특성값(feature) 구성
-    2) FDS 서버에 전송하여 사기 확률 조회
-    3) 사기 → 차단 / 정상 → 토큰 전송
-    4) AI 위험도 점수를 해시화하여 블록에 기록 (ZKP 간략화)
-    """
-    decimals = token_contract.functions.decimals().call()
-    symbol = token_contract.functions.symbol().call()
+    if detail["final_decision"] == "hold_no_history":
+        # 수신자 이력 없음 → 거부 처리 + 송신자에게 반환
+        print(f"\n  [3단계] 수신자 이력 없음 → 송신자에게 반환 (경고)")
+        print(f"  ┌{'─'*50}┐")
+        print(f"  │ ⚠️  경고: 수신자({receiver[:10]}...)의 거래       │")
+        print(f"  │ 이력이 전혀 없습니다.                          │")
+        print(f"  │ AI 사기 검증을 수행할 수 없어 안전을 위해      │")
+        print(f"  │ 송금이 보류(반환) 처리되었습니다.               │")
+        print(f"  │                                                │")
+        print(f"  │ 수신자에게 거래 이력 확보 후 재시도하세요.      │")
+        print(f"  └{'─'*50}┘")
 
-    print(f"\n{'='*60}")
-    print(f"  📤 송금 시도: {sender[:10]}... → {receiver[:10]}...")
-    print(f"     금액: {amount:,.2f} {symbol}")
-    print(f"{'='*60}")
-
-    # ── Step 1: Feature 구성 ──
-    features = build_features(w3, sender, receiver, amount, tx_history)
-
-    # ── Step 2: FDS 서버에 질의 ──
-    fds_result = query_fds(features)
-
-    if fds_result is None:
-        # FDS 서버 연결 실패 → 안전 모드: 차단
-        fraud_score = 100.0
-        is_fraud = True
-        print(f"\n  ⛔ FDS 서버 미응답 — 안전 모드로 거래를 차단합니다.")
-    else:
-        fraud_score = fds_result["pred_proba"]
-        is_fraud = fds_result["pred_label"] == 1
-
-    # ── Step 3: 차단 또는 전송 ──
-    timestamp = int(time.time())
-    score_hash = compute_score_hash(sender, receiver, amount, fraud_score, timestamp)
-
-    if is_fraud:
-        print(f"\n  🚨 사기 의심 거래 차단!")
-        print(f"     사기 확률: {fraud_score:.2f}%")
-        print(f"     → 토큰 전송이 실행되지 않습니다.")
-
-        # 차단된 거래도 감사 기록은 남긴다 (불변성)
-        if audit_contract:
-            record_audit_on_chain(
-                w3, audit_contract, deployer,
-                sender, receiver, amount,
-                fraud_score, score_hash, blocked=True
-            )
-        return None
-
-    else:
-        print(f"\n  ✅ 정상 거래 승인!")
-        print(f"     사기 확률: {fraud_score:.2f}%")
-
-        # 토큰 전송 실행
-        raw_amount = int(amount * (10 ** decimals))
-        tx = token_contract.functions.transfer(receiver, raw_amount).build_transaction({
-            "from": sender,
-            "nonce": w3.eth.get_transaction_count(sender),
-            "gas": 200_000,
+        tx = contract.functions.escrowReject(tx_id).build_transaction({
+            "from":     deployer,
+            "nonce":    w3.eth.get_transaction_count(deployer),
+            "gas":      100_000,
             "gasPrice": w3.eth.gas_price,
         })
-
         tx_hash = w3.eth.send_transaction(tx)
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+        w3.eth.wait_for_transaction_receipt(tx_hash)
+        print(f"  ↩️  {amount:,.2f} {symbol} → 송신자에게 반환 완료")
 
-        print(f"\n  [+] 토큰 전송 완료!")
-        print(f"      TX 해시   : {tx_hash.hex()}")
-        print(f"      블록 번호 : {receipt.blockNumber}")
+    elif is_safe:
+        # 임계값 근처인지 확인 (caution zone)
+        threshold_pct = detail.get("ai_result", {}).get("threshold", 50) if detail.get("ai_result") else 40
+        caution_lower = threshold_pct * 0.6   # 임계값의 60% 이상이면 주의
+        is_caution = final_score >= caution_lower
 
-        # 정상 거래도 감사 기록을 남긴다
-        if audit_contract:
-            record_audit_on_chain(
-                w3, audit_contract, deployer,
-                sender, receiver, amount,
-                fraud_score, score_hash, blocked=False
-            )
-        return receipt
+        if is_caution:
+            print(f"\n  [3단계] 정상 판별이나 주의 필요 → 전송 승인 (경고 포함)")
+            print(f"  ┌{'─'*50}┐")
+            print(f"  │ ⚠️  주의: 사기 확률({final_score:.1f}%)이 임계값     │")
+            print(f"  │ ({threshold_pct}%)에 근접합니다.                     │")
+            print(f"  │                                                │")
+            print(f"  │ 수신자의 거래 패턴에 일부 의심스러운 요소가     │")
+            print(f"  │ 감지되었습니다. 거래 상대방을 한 번 더         │")
+            print(f"  │ 확인하시기 바랍니다.                           │")
+            print(f"  └{'─'*50}┘")
+        else:
+            print(f"\n  [3단계] 정상 판별 → 수신자에게 전송 승인")
+
+        tx = contract.functions.escrowApprove(tx_id).build_transaction({
+            "from":     deployer,
+            "nonce":    w3.eth.get_transaction_count(deployer),
+            "gas":      100_000,
+            "gasPrice": w3.eth.gas_price,
+        })
+        tx_hash = w3.eth.send_transaction(tx)
+        w3.eth.wait_for_transaction_receipt(tx_hash)
+        print(f"  ✅ 전송 완료! {amount:,.2f} {symbol} → {receiver[:10]}...")
+
+    else:
+        # 임계값 바로 위인지 확인 (caution zone)
+        threshold_pct = detail.get("ai_result", {}).get("threshold", 50) if detail.get("ai_result") else 40
+        caution_upper = threshold_pct * 1.4   # 임계값의 140% 이하면 주의
+        is_caution = final_score <= caution_upper
+
+        if is_caution:
+            print(f"\n  [3단계] 사기 의심(확률 {proba:.1f}%) → 송신자에게 반환")
+            print(f"  ┌{'─'*50}┐")
+            print(f"  │ ⚠️  참고: 사기 확률({final_score:.1f}%)이 임계값     │")
+            print(f"  │ ({threshold_pct}%) 근처입니다.                      │")
+            print(f"  │                                                │")
+            print(f"  │ 확실한 사기가 아닐 수 있으니 수신자 정보를     │")
+            print(f"  │ 직접 확인한 후 재시도를 고려하세요.            │")
+            print(f"  └{'─'*50}┘")
+        else:
+            print(f"\n  [3단계] 사기 의심(확률 {proba:.1f}%) → 송신자에게 반환")
+
+        tx = contract.functions.escrowReject(tx_id).build_transaction({
+            "from":     deployer,
+            "nonce":    w3.eth.get_transaction_count(deployer),
+            "gas":      100_000,
+            "gasPrice": w3.eth.gas_price,
+        })
+        tx_hash = w3.eth.send_transaction(tx)
+        w3.eth.wait_for_transaction_receipt(tx_hash)
+        print(f"  ⚠️  전송 취소! {amount:,.2f} {symbol} → 송신자에게 반환 완료")
+
+    print(f"{'─'*55}")
+    return detail
 
 
-# ═══════════════════════════════════════════════════════════════
-#  메인 실행
-# ═══════════════════════════════════════════════════════════════
 def main():
     # ── Ganache 연결 ──
     w3 = Web3(Web3.HTTPProvider(GANACHE_URL))
-
     if not w3.is_connected():
         print("[!] Ganache에 연결할 수 없습니다.")
         sys.exit(1)
-
     print(f"[+] Ganache 연결 성공 — {GANACHE_URL}\n")
 
     # ── 컨트랙트 로드 ──
-    token_contract, audit_contract, deploy_info = load_contracts(w3)
-    print(f"[+] Token 컨트랙트 로드 완료 — {deploy_info.get('token_address', deploy_info.get('contract_address'))}")
-    if audit_contract:
-        print(f"[+] FraudAudit 컨트랙트 로드 완료 — {deploy_info['audit_address']}")
+    contract, deploy_info = load_contract(w3)
+    print(f"[+] 컨트랙트 로드 완료 — {deploy_info['contract_address']}\n")
 
-    # ── 토큰 정보 조회 ──
-    get_token_info(token_contract)
+    get_token_info(contract)
 
-    # ── Ganache 계정 목록 ──
-    accounts = w3.eth.accounts
-    deployer = accounts[0]
+    accounts  = w3.eth.accounts
+    deployer  = accounts[0]
     receiver1 = accounts[1]
     receiver2 = accounts[2]
 
-    # ── 전송 전 잔액 확인 ──
+    # ── 전송 전 잔액 ──
     print("\n[잔액 확인 — 전송 전]")
-    check_balance(token_contract, deployer)
-    check_balance(token_contract, receiver1)
-    check_balance(token_contract, receiver2)
+    check_balance(contract, deployer,          "배포자")
+    check_balance(contract, receiver1,         "수신자1")
+    check_balance(contract, receiver2,         "수신자2")
+    check_balance(contract, contract.address,  "컨트랙트(에스크로)")
 
-    # ══════════════════════════════════════════════════════════
-    # 데모 시나리오 1: 정상 거래
-    # 정상적인 거래 패턴의 Feature를 FDS 서버에 전송
-    # ══════════════════════════════════════════════════════════
-    normal_features = {
-        "Avg min between sent tnx": 844.27,
-        "Avg min between received tnx": 1200.50,
-        "Time Diff between first and last (Mins)": 200000,
-        "Sent tnx": 50,
-        "Received Tnx": 45,
-        "Number of Created Contracts": 0,
-        "Unique Received From Addresses": 20,
-        "Unique Sent To Addresses": 15,
-        "min value received": 0.01,
-        "max value received": 5.0,
-        "avg val received": 1.2,
-        "min val sent": 0.05,
-        "max val sent": 3.0,
-        "avg val sent": 0.8,
-        "min value sent to contract": 0,
-        "max val sent to contract": 0,
-        "avg value sent to contract": 0,
-        "total transactions (including tnx to create contract": 95,
-        "total Ether sent": 40.0,
-        "total ether received": 54.0,
-        "total ether sent contracts": 0,
-        "total ether balance": 14.0,
-        "Total ERC20 tnxs": 10,
-        "ERC20 total Ether received": 5.0,
-        "ERC20 total ether sent": 3.0,
-        "ERC20 total Ether sent contract": 0,
-        "ERC20 uniq sent addr": 5,
-        "ERC20 uniq rec addr": 4,
-        "ERC20 uniq rec contract addr": 0,
-        "ERC20 avg time between sent tnx": 5000,
-        "ERC20 avg time between rec tnx": 6000,
-        "ERC20 avg time between contract tnx": 0,
-        "ERC20 min val rec": 0.1,
-        "ERC20 max val rec": 2.0,
-        "ERC20 avg val rec": 0.8,
-        "ERC20 min val sent": 0.05,
-        "ERC20 max val sent": 1.5,
-        "ERC20 avg val sent": 0.6,
-        "ERC20 min val sent contract": 0,
-        "ERC20 max val sent contract": 0,
-        "ERC20 avg val sent contract": 0,
-        "has_erc20_activity": 1,
-        "sent_received_ratio": 0.74,
-        "unique_counterparty_ratio": 0.3,
-    }
+    # ── 에스크로 전송 ──
+    print("\n\n=== 에스크로 전송 시작 ===")
+    escrow_send(w3, contract, deployer, receiver1, 500)
+    escrow_send(w3, contract, deployer, receiver2, 300)
 
-    print("\n" + "▶" * 30)
-    print("  데모 시나리오 1: 정상 거래")
-    print("▶" * 30)
-    safe_transfer(
-        w3, token_contract, audit_contract, deployer,
-        sender=deployer, receiver=receiver1, amount=500,
-        tx_history=normal_features
-    )
+    # ── 전송 후 잔액 ──
+    print("\n[잔액 확인 — 전송 후]")
+    check_balance(contract, deployer,          "배포자")
+    check_balance(contract, receiver1,         "수신자1")
+    check_balance(contract, receiver2,         "수신자2")
+    check_balance(contract, contract.address,  "컨트랙트(에스크로)")
 
-    # ══════════════════════════════════════════════════════════
-    # 데모 시나리오 2: 사기 의심 거래
-    # 사기 패턴의 Feature를 FDS 서버에 전송
-    # (짧은 시간 내 반복 거래, 수신만 있고 송신 없음 등)
-    # ══════════════════════════════════════════════════════════
-    fraud_features = {
-        "Avg min between sent tnx": 0,
-        "Avg min between received tnx": 36572.61,
-        "Time Diff between first and last (Mins)": 182863.07,
-        "Sent tnx": 0,
-        "Received Tnx": 5,
-        "Number of Created Contracts": 0,
-        "Unique Received From Addresses": 3,
-        "Unique Sent To Addresses": 0,
-        "min value received": 0,
-        "max value received": 0,
-        "avg val received": 0,
-        "min val sent": 0,
-        "max val sent": 0,
-        "avg val sent": 0,
-        "min value sent to contract": 0,
-        "max val sent to contract": 0,
-        "avg value sent to contract": 0,
-        "total transactions (including tnx to create contract": 6,
-        "total Ether sent": 0,
-        "total ether received": 0,
-        "total ether sent contracts": 0,
-        "total ether balance": 0,
-        "Total ERC20 tnxs": 0,
-        "ERC20 total Ether received": 0,
-        "ERC20 total ether sent": 0,
-        "ERC20 total Ether sent contract": 0,
-        "ERC20 uniq sent addr": 0,
-        "ERC20 uniq rec addr": 0,
-        "ERC20 uniq rec contract addr": 0,
-        "ERC20 avg time between sent tnx": 0,
-        "ERC20 avg time between rec tnx": 0,
-        "ERC20 avg time between contract tnx": 0,
-        "ERC20 min val rec": 0,
-        "ERC20 max val rec": 0,
-        "ERC20 avg val rec": 0,
-        "ERC20 min val sent": 0,
-        "ERC20 max val sent": 0,
-        "ERC20 avg val sent": 0,
-        "ERC20 min val sent contract": 0,
-        "ERC20 max val sent contract": 0,
-        "ERC20 avg val sent contract": 0,
-        "has_erc20_activity": 0,
-        "sent_received_ratio": 0,
-        "unique_counterparty_ratio": 0,
-    }
-
-    print("\n" + "▶" * 30)
-    print("  데모 시나리오 2: 사기 의심 거래")
-    print("▶" * 30)
-    safe_transfer(
-        w3, token_contract, audit_contract, deployer,
-        sender=deployer, receiver=receiver2, amount=300,
-        tx_history=fraud_features
-    )
-
-    # ── 전송 후 잔액 확인 ──
-    print("\n\n[잔액 확인 — 전송 후]")
-    check_balance(token_contract, deployer)
-    check_balance(token_contract, receiver1)
-    check_balance(token_contract, receiver2)
-
-    # ── 감사 기록 확인 ──
-    if audit_contract:
-        count = audit_contract.functions.getAuditCount().call()
-        print(f"\n[FraudAudit] 총 감사 기록 수: {count}건")
-        for i in range(count):
-            record = audit_contract.functions.auditLog(i).call()
-            print(f"\n  기록 #{i}:")
-            print(f"    송신자     : {record[0][:10]}...")
-            print(f"    수신자     : {record[1][:10]}...")
-            print(f"    금액(wei)  : {record[2]}")
-            print(f"    위험도     : {record[3] / 100:.2f}%")
-            print(f"    해시       : {record[4].hex()}")
-            print(f"    차단 여부  : {'차단' if record[5] else '통과'}")
-            print(f"    타임스탬프 : {record[6]}")
-
-    print(f"\n[+] interact.py 실행 완료")
+    print("\n[+] interact.py 실행 완료")
 
 
 if __name__ == "__main__":

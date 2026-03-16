@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-// ─────────────────────────────────────────────────────────────
-// FraudDetectionToken (FDT) — ERC-20 기본 토큰
-// ─────────────────────────────────────────────────────────────
 contract Token {
+    // ── ERC-20 기본 ───────────────────────────────────────────
     string public name = "FraudDetectionToken";
     string public symbol = "FDT";
     uint8 public decimals = 18;
@@ -16,12 +14,41 @@ contract Token {
     event Transfer(address indexed from, address indexed to, uint256 value);
     event Approval(address indexed owner, address indexed spender, uint256 value);
 
+    // ── 에스크로 구조 ─────────────────────────────────────────
+    enum EscrowStatus { Pending, Approved, Rejected }
+
+    struct EscrowTx {
+        address sender;     // 송신자
+        address receiver;   // 수신자
+        uint256 amount;     // 잠긴 토큰 수량
+        EscrowStatus status;
+    }
+
+    // txId => EscrowTx
+    mapping(uint256 => EscrowTx) public escrows;
+    uint256 public nextTxId;
+
+    // 에스크로 컨트랙트 소유자 (AI 승인/거부 권한)
+    address public owner;
+
+    event EscrowDeposited(uint256 indexed txId, address indexed sender, address indexed receiver, uint256 amount);
+    event EscrowApproved(uint256 indexed txId, address indexed receiver, uint256 amount);
+    event EscrowRejected(uint256 indexed txId, address indexed sender, uint256 amount);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner can call this");
+        _;
+    }
+
+    // ── 생성자 ────────────────────────────────────────────────
     constructor(uint256 _initialSupply) {
         totalSupply = _initialSupply * (10 ** uint256(decimals));
         balanceOf[msg.sender] = totalSupply;
+        owner = msg.sender;
         emit Transfer(address(0), msg.sender, totalSupply);
     }
 
+    // ── ERC-20 기본 함수 ──────────────────────────────────────
     function transfer(address _to, uint256 _value) public returns (bool success) {
         require(_to != address(0), "Transfer to zero address");
         require(balanceOf[msg.sender] >= _value, "Insufficient balance");
@@ -51,97 +78,79 @@ contract Token {
         emit Transfer(_from, _to, _value);
         return true;
     }
-}
 
-// ─────────────────────────────────────────────────────────────
-// FraudAudit — ZKP(간략화) 사기 탐지 기록 컨트랙트
-// AI가 판단한 위험도 점수를 해시화하여 블록에 기록함으로써
-// 데이터의 불변성을 유지한다. (2주차)
-// ─────────────────────────────────────────────────────────────
-contract FraudAudit {
-    address public owner;
+    // ── 에스크로 함수 ─────────────────────────────────────────
 
-    // 감사 기록 구조체
-    struct AuditRecord {
-        address sender;          // 송금 시도자
-        address receiver;        // 수신자
-        uint256 amount;          // 송금 시도 금액 (wei 단위)
-        uint256 fraudScore;      // AI 위험도 점수 (0~10000, 소수점 2자리 * 100)
-        bytes32 scoreHash;       // 위험도 점수 + 피처의 keccak256 해시 (ZKP 간략화)
-        bool blocked;            // 차단 여부
-        uint256 timestamp;       // 기록 시각
+    /**
+     * @dev 송신자가 토큰을 컨트랙트에 예치 (잠금)
+     *      AI 검증이 완료될 때까지 토큰은 컨트랙트가 보관
+     * @param _receiver 최종 수신자 주소
+     * @param _amount   전송할 토큰 수량 (단위: wei, 즉 10^18 기준)
+     * @return txId     이 에스크로 거래의 고유 ID
+     */
+    function escrowDeposit(address _receiver, uint256 _amount) public returns (uint256 txId) {
+        require(_receiver != address(0), "Invalid receiver");
+        require(balanceOf[msg.sender] >= _amount, "Insufficient balance");
+
+        // 송신자 잔액에서 차감 → 컨트랙트(address(this))로 이동
+        balanceOf[msg.sender] -= _amount;
+        balanceOf[address(this)] += _amount;
+
+        txId = nextTxId;
+        escrows[txId] = EscrowTx({
+            sender:   msg.sender,
+            receiver: _receiver,
+            amount:   _amount,
+            status:   EscrowStatus.Pending
+        });
+        nextTxId++;
+
+        emit EscrowDeposited(txId, msg.sender, _receiver, _amount);
+        return txId;
     }
 
-    // 전체 감사 기록 배열
-    AuditRecord[] public auditLog;
+    /**
+     * @dev AI가 정상 판별 → 컨트랙트에서 수신자에게 토큰 전송
+     * @param _txId 승인할 에스크로 거래 ID
+     */
+    function escrowApprove(uint256 _txId) public onlyOwner {
+        EscrowTx storage eTx = escrows[_txId];
+        require(eTx.status == EscrowStatus.Pending, "Not pending");
 
-    // 이벤트: 정상 거래 통과
-    event TransactionApproved(
-        uint256 indexed recordId,
-        address indexed sender,
-        address indexed receiver,
+        eTx.status = EscrowStatus.Approved;
+        balanceOf[address(this)] -= eTx.amount;
+        balanceOf[eTx.receiver]  += eTx.amount;
+
+        emit Transfer(address(this), eTx.receiver, eTx.amount);
+        emit EscrowApproved(_txId, eTx.receiver, eTx.amount);
+    }
+
+    /**
+     * @dev AI가 사기 판별 → 컨트랙트에서 송신자에게 토큰 반환
+     * @param _txId 거부할 에스크로 거래 ID
+     */
+    function escrowReject(uint256 _txId) public onlyOwner {
+        EscrowTx storage eTx = escrows[_txId];
+        require(eTx.status == EscrowStatus.Pending, "Not pending");
+
+        eTx.status = EscrowStatus.Rejected;
+        balanceOf[address(this)] -= eTx.amount;
+        balanceOf[eTx.sender]    += eTx.amount;
+
+        emit Transfer(address(this), eTx.sender, eTx.amount);
+        emit EscrowRejected(_txId, eTx.sender, eTx.amount);
+    }
+
+    /**
+     * @dev 에스크로 거래 상태 조회
+     */
+    function getEscrow(uint256 _txId) public view returns (
+        address sender,
+        address receiver,
         uint256 amount,
-        uint256 fraudScore,
-        bytes32 scoreHash
-    );
-
-    // 이벤트: 사기 의심 거래 차단
-    event TransactionBlocked(
-        uint256 indexed recordId,
-        address indexed sender,
-        address indexed receiver,
-        uint256 amount,
-        uint256 fraudScore,
-        bytes32 scoreHash
-    );
-
-    constructor() {
-        owner = msg.sender;
-    }
-
-    /// @notice AI FDS 판단 결과를 블록체인에 기록한다
-    /// @param _sender    송금 시도자 주소
-    /// @param _receiver  수신자 주소
-    /// @param _amount    송금 시도 금액
-    /// @param _fraudScore AI 위험도 점수 (예: 8732 = 87.32%)
-    /// @param _scoreHash  오프체인에서 계산한 keccak256 해시
-    /// @param _blocked   차단 여부
-    function recordAudit(
-        address _sender,
-        address _receiver,
-        uint256 _amount,
-        uint256 _fraudScore,
-        bytes32 _scoreHash,
-        bool    _blocked
-    ) public {
-        uint256 recordId = auditLog.length;
-
-        auditLog.push(AuditRecord({
-            sender:     _sender,
-            receiver:   _receiver,
-            amount:     _amount,
-            fraudScore: _fraudScore,
-            scoreHash:  _scoreHash,
-            blocked:    _blocked,
-            timestamp:  block.timestamp
-        }));
-
-        if (_blocked) {
-            emit TransactionBlocked(recordId, _sender, _receiver, _amount, _fraudScore, _scoreHash);
-        } else {
-            emit TransactionApproved(recordId, _sender, _receiver, _amount, _fraudScore, _scoreHash);
-        }
-    }
-
-    /// @notice 전체 감사 기록 수 조회
-    function getAuditCount() public view returns (uint256) {
-        return auditLog.length;
-    }
-
-    /// @notice 특정 기록의 해시를 온체인에서 검증
-    /// @dev 오프체인 해시와 온체인 저장값을 비교하여 무결성 확인
-    function verifyHash(uint256 _recordId, bytes32 _expectedHash) public view returns (bool) {
-        require(_recordId < auditLog.length, "Record does not exist");
-        return auditLog[_recordId].scoreHash == _expectedHash;
+        EscrowStatus status
+    ) {
+        EscrowTx storage eTx = escrows[_txId];
+        return (eTx.sender, eTx.receiver, eTx.amount, eTx.status);
     }
 }

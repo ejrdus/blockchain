@@ -10,42 +10,17 @@ dev/
 ├── requirements.txt             # Python 패키지 목록
 │
 ├── A_blockchain/                # A파트: 블록체인 연동
-│   ├── read_block.py            # Ganache 블록 해시/넌스/트랜잭션 읽기
-│   └── ganache_setup.md         # Ganache 실행 가이드
+│   └── read_block.py            # Ganache 블록 해시/넌스/트랜잭션 읽기
 │
 ├── B_ai_fds/                    # B파트: AI 사기탐지 서버
 │   ├── main.py                  # FastAPI 서버 (POST /predict)
 │   ├── fraud_model_artifact.pkl # 학습된 LightGBM 모델
-│   ├── req.json                 # 테스트용 요청 샘플
-│   └── train/                   # 모델 학습 자료
-│       ├── transaction_dataset.csv  # Kaggle 원본 데이터셋
-│       ├── pre.ipynb                # 전처리 노트북
-│       ├── dataset.csv              # 전처리 완료 데이터
-│       └── train.ipynb              # 모델 학습 노트북
+│   └── req.json                 # 테스트용 요청 샘플
 │
 └── C_smart_contract/            # C파트: 스마트 컨트랙트
-    ├── contracts/Token.sol      # ERC-20 토큰 (FDT) + FraudAudit 컨트랙트
-    ├── deploy.py                # Token + FraudAudit 컴파일 및 배포
-    └── interact.py              # FDS 연동 토큰 전송 (사기 탐지 → 차단/허용)
-```
-
-## 시스템 흐름 (2주차 완성)
-
-```
-송금 시도
-  │
-  ▼
-interact.py — 거래 Feature 구성
-  │
-  ▼
-FDS 서버 (main.py) — POST /predict
-  │
-  ├─ 정상 (사기 확률 < 임계값) → 토큰 전송 실행
-  │
-  └─ 사기 (사기 확률 ≥ 임계값) → 거래 차단
-  │
-  ▼
-FraudAudit 컨트랙트 — 위험도 점수 해시를 블록에 기록 (ZKP 간략화)
+    ├── contracts/Token.sol      # ERC-20 토큰 (FDT) Solidity 코드
+    ├── deploy.py                # 컨트랙트 컴파일 및 배포
+    └── interact.py              # 배포된 컨트랙트와 토큰 전송 테스트
 ```
 
 ## 사전 준비
@@ -82,7 +57,36 @@ brew install libomp
 Ganache GUI를 열고 **Quickstart** 클릭합니다.
 상단에 `RPC SERVER: HTTP://127.0.0.1:7545`가 표시되면 준비 완료입니다.
 
-### Step 2: FDS 서버 실행
+(CLI 버전 사용 시: `ganache` 명령어 실행)
+
+### Step 2: A파트 — 블록 읽기
+
+```bash
+python A_blockchain/read_block.py
+```
+
+Ganache의 최근 블록 해시, 넌스, 트랜잭션 정보를 읽고 `blocks_output.json`에 저장합니다.
+
+### Step 3: C파트 — 스마트 컨트랙트 배포
+
+```bash
+python C_smart_contract/deploy.py
+```
+
+`Token.sol`을 컴파일하고 Ganache에 배포합니다.
+실행 후 `C_smart_contract/abi/Token.json`과 `C_smart_contract/deploy_info.json`이 생성됩니다.
+
+### Step 4: C파트 — 토큰 전송 테스트
+
+```bash
+python C_smart_contract/interact.py
+```
+
+배포된 FDT 토큰을 계정 간 전송하고 잔액 변화를 확인합니다.
+
+> **주의**: Step 3(deploy)을 먼저 실행해야 합니다. interact.py는 deploy가 생성한 파일을 읽습니다.
+
+### Step 5: B파트 — AI FDS 서버 실행
 
 ```bash
 python B_ai_fds/main.py
@@ -90,41 +94,32 @@ python B_ai_fds/main.py
 
 `http://127.0.0.1:8000`에서 FastAPI 서버가 시작됩니다.
 
-### Step 3: 스마트 컨트랙트 배포
+### Step 6: 사기 탐지 테스트
 
-**새 터미널**에서 실행합니다:
-
-```bash
-python C_smart_contract/deploy.py
-```
-
-Token + FraudAudit 컨트랙트를 컴파일하고 Ganache에 배포합니다.
-
-### Step 4: 데모 실행 (FDS 연동 토큰 전송)
+**새 터미널을 열고** (서버는 그대로 두고) 실행합니다:
 
 ```bash
-python C_smart_contract/interact.py
+curl -X POST "http://127.0.0.1:8000/predict" \
+  -H "Content-Type: application/json" \
+  -d @B_ai_fds/req.json
 ```
 
-데모 시나리오 2개가 자동 실행됩니다:
+응답 예시:
 
-1. **정상 거래**: FDS가 정상 판정 → 토큰 전송 완료 → 감사 기록 (통과)
-2. **사기 거래**: FDS가 사기 탐지 → 토큰 전송 차단 → 감사 기록 (차단)
-
-두 경우 모두 AI 위험도 점수가 해시화되어 블록체인에 기록됩니다.
-
-### (선택) 블록 읽기
-
-```bash
-python A_blockchain/read_block.py
+```json
+{"pred_label": 1, "pred_proba": 99.977, "threshold": 32.0}
 ```
 
-Ganache의 최근 블록 해시, 넌스, 트랜잭션 정보를 확인합니다.
+| 필드 | 설명 |
+|---|---|
+| `pred_label` | 0 = 정상, 1 = 사기 |
+| `pred_proba` | 사기 확률 (%) |
+| `threshold` | 판정 기준치 (%) |
 
 ## 실행 순서 요약
 
 ```
-Ganache 실행 → B (main.py 서버) → C (deploy → interact) → A (read_block, 선택)
+Ganache 실행 → A (read_block) → C (deploy → interact) → B (main.py 서버 실행 → curl 테스트)
 ```
 
 ## 기술 스택
@@ -132,5 +127,4 @@ Ganache 실행 → B (main.py 서버) → C (deploy → interact) → A (read_bl
 - **네트워크**: Ganache (로컬 이더리움)
 - **백엔드**: Python, Web3.py, FastAPI
 - **AI 모델**: LightGBM (Kaggle Ethereum Fraud Detection 데이터셋)
-- **스마트 컨트랙트**: Solidity 0.8.0 (ERC-20 토큰 + FraudAudit)
-- **ZKP(간략화)**: keccak256 해시 기반 위험도 점수 블록 기록
+- **스마트 컨트랙트**: Solidity 0.8.0 (ERC-20 토큰)

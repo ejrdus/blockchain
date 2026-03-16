@@ -131,6 +131,111 @@ def _print_block(info: dict) -> None:
     print("─" * 62)
 
 
+# ── 특정 지갑 주소 분석 (B파트 feature 계산) ─────────────────
+def analyze_address(w3: Web3, target_address: str) -> dict:
+    """
+    특정 지갑 주소의 모든 TX를 전수 스캔하여
+    B파트 AI 모델에 필요한 feature 딕셔너리를 반환합니다.
+    """
+    target_address = w3.to_checksum_address(target_address)
+
+    sent_times, recv_times = [], []
+    sent_values, recv_values = [], []
+    sent_to_addrs, recv_from_addrs = set(), set()
+    sent_to_contract_values = []
+
+    latest = w3.eth.block_number
+    logger.info(f"주소 분석 시작: {target_address} (블록 0 ~ {latest})")
+
+    for num in range(0, latest + 1):
+        block = w3.eth.get_block(num, full_transactions=True)
+        for tx in block.transactions:
+            val = float(w3.from_wei(tx["value"], "ether"))
+            ts  = block.timestamp
+            frm = tx["from"]
+            to  = tx["to"]
+
+            if frm == target_address:
+                sent_times.append(ts)
+                sent_values.append(val)
+                if to:
+                    sent_to_addrs.add(to)
+                    # to 주소가 컨트랙트인지 판별 (코드가 있으면 컨트랙트)
+                    if w3.eth.get_code(to) != b"":
+                        sent_to_contract_values.append(val)
+
+            if to == target_address:
+                recv_times.append(ts)
+                recv_values.append(val)
+                recv_from_addrs.add(frm)
+
+    def avg_gap_min(times):
+        sorted_t = sorted(times)
+        if len(sorted_t) < 2:
+            return 0
+        gaps = [(sorted_t[i+1] - sorted_t[i]) / 60 for i in range(len(sorted_t) - 1)]
+        return sum(gaps) / len(gaps)
+
+    all_times = sorted(sent_times + recv_times)
+    time_diff = (all_times[-1] - all_times[0]) / 60 if len(all_times) >= 2 else 0
+
+    total_sent     = sum(sent_values)
+    total_received = sum(recv_values)
+    total_sent_contract = sum(sent_to_contract_values)
+
+    features = {
+        "Avg min between sent tnx":                    avg_gap_min(sent_times),
+        "Avg min between received tnx":                avg_gap_min(recv_times),
+        "Time Diff between first and last (Mins)":     time_diff,
+        "Sent tnx":                                    len(sent_times),
+        "Received Tnx":                                len(recv_times),
+        "Number of Created Contracts":                 0,
+        "Unique Received From Addresses":              len(recv_from_addrs),
+        "Unique Sent To Addresses":                    len(sent_to_addrs),
+        "min value received":                          min(recv_values) if recv_values else 0,
+        "max value received":                          max(recv_values) if recv_values else 0,
+        "avg val received":                            sum(recv_values) / len(recv_values) if recv_values else 0,
+        "min val sent":                                min(sent_values) if sent_values else 0,
+        "max val sent":                                max(sent_values) if sent_values else 0,
+        "avg val sent":                                sum(sent_values) / len(sent_values) if sent_values else 0,
+        "min value sent to contract":                  min(sent_to_contract_values) if sent_to_contract_values else 0,
+        "max val sent to contract":                    max(sent_to_contract_values) if sent_to_contract_values else 0,
+        "avg value sent to contract":                  sum(sent_to_contract_values) / len(sent_to_contract_values) if sent_to_contract_values else 0,
+        "total transactions (including tnx to create contract": len(sent_times) + len(recv_times),
+        "total Ether sent":                            total_sent,
+        "total ether received":                        total_received,
+        "total ether sent contracts":                  total_sent_contract,
+        "total ether balance":                         total_received - total_sent,
+        # ERC20 관련 (로컬 Ganache에서는 이벤트 추적 미구현 → 0)
+        "Total ERC20 tnxs":                            0,
+        "ERC20 total Ether received":                  0,
+        "ERC20 total ether sent":                      0,
+        "ERC20 total Ether sent contract":             0,
+        "ERC20 uniq sent addr":                        0,
+        "ERC20 uniq rec addr":                         0,
+        "ERC20 uniq rec contract addr":                0,
+        "ERC20 avg time between sent tnx":             0,
+        "ERC20 avg time between rec tnx":              0,
+        "ERC20 avg time between contract tnx":         0,
+        "ERC20 min val rec":                           0,
+        "ERC20 max val rec":                           0,
+        "ERC20 avg val rec":                           0,
+        "ERC20 min val sent":                          0,
+        "ERC20 max val sent":                          0,
+        "ERC20 avg val sent":                          0,
+        "ERC20 min val sent contract":                 0,
+        "ERC20 max val sent contract":                 0,
+        "ERC20 avg val sent contract":                 0,
+        # 파생 변수
+        "has_erc20_activity":                          0,
+        "sent_received_ratio":                         total_sent / (total_received + 1e-9),
+        "unique_counterparty_ratio":                   len(sent_to_addrs) / (len(sent_times) + 1e-9),
+    }
+
+    logger.info(f"분석 완료: 송신 {len(sent_times)}건 / 수신 {len(recv_times)}건")
+    return features
+
+
 # ── JSON 저장 (B파트 전달용) ─────────────────────────────────
 def save_to_json(blocks: list, filepath: str = "blocks_output.json") -> None:
     with open(filepath, "w", encoding="utf-8") as f:
