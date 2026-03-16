@@ -4,16 +4,12 @@ import os
 # 어디서 실행하든 main.py 기준으로 pkl 파일을 찾도록 절대 경로 사용
 _dir = os.path.dirname(os.path.abspath(__file__))
 
-# Ganache 맞춤 모델 우선 로드, 없으면 기존 모델 사용
-ganache_model_path = os.path.join(_dir, "ganache_model_artifact.pkl")
-legacy_model_path = os.path.join(_dir, "fraud_model_artifact.pkl")
+# 실제 이더리움 데이터(Kaggle) 학습 모델 사용
+# → 자체 시뮬레이션 데이터로 학습 시 순환 검증 문제 발생, 실 데이터 모델이 학술적으로 유효
+real_model_path = os.path.join(_dir, "fraud_model_artifact.pkl")
 
-if os.path.exists(ganache_model_path):
-    artifact = joblib.load(ganache_model_path)
-    print(f"[+] Ganache 맞춤 모델 로드: {artifact['model_name']}")
-else:
-    artifact = joblib.load(legacy_model_path)
-    print(f"[!] 기존 모델 사용: {artifact['model_name']} (train_ganache_model.py를 실행하세요)")
+artifact = joblib.load(real_model_path)
+print(f"[+] 실 이더리움 데이터 모델 로드: {artifact['model_name']}")
 
 model = artifact["model"]
 feature_cols = artifact["feature_cols"]

@@ -18,6 +18,9 @@ import os
 import sys
 import requests
 import pandas as pd
+import joblib
+import shap
+import numpy as np
 from datetime import datetime, timezone
 
 from web3 import Web3
@@ -45,6 +48,73 @@ ACCOUNT_LABELS = [
 # ═══════════════════════════════════════════════════════════════
 # 연결 & 로드
 # ═══════════════════════════════════════════════════════════════
+
+SHAP_CSV_PATH = os.path.join(ROOT_DIR, "shap_results.csv")
+
+
+@st.cache_resource
+def load_fraud_model():
+    """SHAP 계산용 실 이더리움 모델 로드"""
+    model_path = os.path.join(ROOT_DIR, "B_ai_fds", "fraud_model_artifact.pkl")
+    return joblib.load(model_path)
+
+
+@st.cache_resource
+def get_shap_explainer():
+    """TreeExplainer 캐싱 (느린 초기화 1회만)"""
+    artifact = load_fraud_model()
+    return shap.TreeExplainer(artifact["model"]), artifact["feature_cols"]
+
+
+def compute_and_save_shap(features: dict, sender: str, receiver: str,
+                           amount: float, result: dict) -> pd.DataFrame | None:
+    """
+    SHAP 값을 계산하고 shap_results.csv에 누적 저장한다.
+    반환: SHAP 값 DataFrame (UI 표시용), 실패 시 None
+    """
+    try:
+        explainer, feature_cols = get_shap_explainer()
+        X = pd.DataFrame([{col: features.get(col, 0) for col in feature_cols}])
+
+        raw = explainer.shap_values(X)
+        # LightGBM 이진 분류: list[2] 또는 단일 array 모두 처리
+        if isinstance(raw, list):
+            sv = np.array(raw[1][0])
+        else:
+            sv = np.array(raw[0])
+
+        # ── CSV 행 구성 ──
+        row = {
+            "timestamp":         datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "sender":            sender,
+            "receiver":          receiver,
+            "amount_fdt":        amount,
+            "fraud_probability": result["final_score"],
+            "threshold":         result["threshold"],
+            "verdict":           "차단" if result["is_fraud"] else "승인",
+        }
+        for col, val in zip(feature_cols, sv):
+            row[f"shap_{col}"] = round(float(val), 6)
+
+        df_row = pd.DataFrame([row])
+        if os.path.exists(SHAP_CSV_PATH):
+            df_row.to_csv(SHAP_CSV_PATH, mode="a", header=False, index=False, encoding="utf-8-sig")
+        else:
+            df_row.to_csv(SHAP_CSV_PATH, mode="w", header=True,  index=False, encoding="utf-8-sig")
+
+        # UI 표시용: feature별 SHAP 절댓값 기준 정렬
+        shap_df = pd.DataFrame({
+            "Feature":    feature_cols,
+            "SHAP 기여값": [round(float(v), 4) for v in sv],
+            "|기여값|":    [round(abs(float(v)), 4) for v in sv],
+        }).sort_values("|기여값|", ascending=False).drop(columns=["|기여값|"])
+
+        return shap_df
+
+    except Exception as e:
+        st.warning(f"SHAP 계산 실패: {e}")
+        return None
+
 
 @st.cache_resource
 def connect():
@@ -400,8 +470,27 @@ with tab2:
 
                 # 판별 결과
                 is_fraud = result["is_fraud"]
+                threshold_pct = result["threshold"]
+                final_score = result["final_score"]
+                # 임계값 ±30% 범위를 caution zone으로 정의
+                caution_margin = threshold_pct * 0.3
+                is_near_threshold = abs(final_score - threshold_pct) <= caution_margin
+
                 if result["detected_patterns"]:
                     st.info(f"참고 패턴: **{', '.join(result['detected_patterns'])}**")
+
+                # ── 임계값 근처 안내창 ──
+                if is_near_threshold:
+                    if not is_fraud:
+                        st.warning(
+                            f"⚠️ **주의: 사기 확률({final_score}%)이 차단 기준({threshold_pct}%)에 근접합니다.**\n\n"
+                            f"사기일 가능성이 있으니 수신자를 **한 번 더 확인**해 보세요."
+                        )
+                    else:
+                        st.warning(
+                            f"⚠️ **참고: 사기 확률({final_score}%)이 차단 기준({threshold_pct}%) 근처입니다.**\n\n"
+                            f"확실한 사기가 아닐 수 있으니 수신자 정보를 직접 확인 후 재시도를 고려하세요."
+                        )
 
                 if not is_fraud:
                     approve_escrow(w3, contract, tx_id)
@@ -413,6 +502,29 @@ with tab2:
                         f"참고 패턴: {', '.join(result['detected_patterns'])}\n\n"
                         f"{amount:,.0f} FDT가 송신자에게 반환되었습니다."
                     )
+
+                # ── SHAP 계산 & CSV 저장 ──
+                if features:
+                    with st.spinner("SHAP 분석 중..."):
+                        shap_df = compute_and_save_shap(
+                            features,
+                            sender=sender_addr,
+                            receiver=receiver_addr,
+                            amount=amount,
+                            result=result,
+                        )
+
+                    if shap_df is not None:
+                        st.success(f"📄 SHAP 결과 저장 완료 → `shap_results.csv`")
+                        with st.expander("📊 SHAP 기여값 (상위 15개 feature)", expanded=False):
+                            st.dataframe(
+                                shap_df.head(15),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                            st.caption(
+                                "양수(+): 사기 확률 상승에 기여 / 음수(−): 사기 확률 하락에 기여"
+                            )
 
                 # 패턴별 점수 상세
                 if features:
@@ -495,9 +607,24 @@ with tab3:
                 with col_a3:
                     st.metric("판별 임계값", f"{result['threshold']}%")
 
+                threshold_pct = result["threshold"]
+                final_score = result["final_score"]
+                caution_margin = threshold_pct * 0.3
+                is_near_threshold = abs(final_score - threshold_pct) <= caution_margin
+
                 if result["is_fraud"]:
                     st.error(f"🚨 사기 의심 — 참고 패턴: {', '.join(result['detected_patterns'])}")
+                    if is_near_threshold:
+                        st.warning(
+                            f"⚠️ 사기 확률({final_score}%)이 차단 기준({threshold_pct}%) 근처입니다. "
+                            f"불확실한 경우이니 수신자를 직접 확인해 보세요."
+                        )
                 else:
+                    if is_near_threshold:
+                        st.warning(
+                            f"⚠️ **주의:** 사기 확률 **{final_score}%** 이 차단 기준 **{threshold_pct}%** 에 근접합니다. "
+                            f"사기일 가능성이 있으니 한 번 더 확인해 보세요."
+                        )
                     st.success("✅ 정상 계좌로 판별")
 
                 # 패턴별 점수 (참고)

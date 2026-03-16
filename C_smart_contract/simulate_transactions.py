@@ -293,21 +293,21 @@ def pattern_layering(w3, accts):
     print("  → 수신 즉시 다른 곳으로 전달 (중개/세탁)")
     print("=" * 60)
 
-    # 먼저 S2에게 자금 모으기 (여러 출처에서 수신)
+    # 먼저 S2에게 자금 모으기 (여러 출처에서 수신) — 중립E는 제외하여 정상 계좌 오염 방지
     send_eth(w3, accts[5], accts[6], 5.0, "Layering 유입1")
     send_eth(w3, accts[7], accts[6], 8.0, "Layering 유입2")
-    send_eth(w3, accts[8], accts[6], 3.0, "Layering 유입3")
+    send_eth(w3, accts[5], accts[6], 3.0, "Layering 유입3")
 
-    # S2가 수신 즉시 사기/중립 계좌로 분산 전달 (정상 계좌 오염 방지)
+    # S2가 수신 즉시 사기/중립 계좌로 분산 전달 (정상 계좌·중립E 오염 방지)
     send_eth(w3, accts[6], accts[7], 4.0, "Layering 즉시전달")
     send_eth(w3, accts[6], accts[9], 3.5, "Layering 즉시전달")
     send_eth(w3, accts[6], accts[5], 3.0, "Layering 즉시전달")
-    send_eth(w3, accts[6], accts[8], 2.5, "Layering 즉시전달")
+    send_eth(w3, accts[6], accts[7], 2.5, "Layering 즉시전달")
     send_eth(w3, accts[6], accts[7], 2.0, "Layering 즉시전달")
 
     # 2차 유입 → 즉시 전달 반복
     send_eth(w3, accts[5], accts[6], 6.0, "Layering 2차 유입")
-    send_eth(w3, accts[6], accts[8], 3.0, "Layering 2차 전달")
+    send_eth(w3, accts[6], accts[7], 3.0, "Layering 2차 전달")
     send_eth(w3, accts[6], accts[9], 2.8, "Layering 2차 전달")
 
 
@@ -336,9 +336,9 @@ def pattern_account_draining(w3, accts):
     print("  → 짧은 시간에 잔액 전부를 1~2곳으로 빼돌림")
     print("=" * 60)
 
-    # S2가 보유한 잔액 대부분을 S3 한 곳으로 대량 전송
-    send_eth(w3, accts[6], accts[7], 10.0, "Draining 대량인출1")
-    send_eth(w3, accts[6], accts[7], 8.0,  "Draining 대량인출2")
+    # S2가 보유한 잔액 대부분을 S3 한 곳으로 대량 전송 (금액 축소 → AI 확률 현실적으로)
+    send_eth(w3, accts[6], accts[7], 6.0, "Draining 대량인출1")
+    send_eth(w3, accts[6], accts[7], 4.0, "Draining 대량인출2")
 
 
 def pattern_roundtrip(w3, accts):
@@ -446,8 +446,8 @@ def pattern_pump_collect(w3, accts):
     print("  → 여러 곳에서 소액 수집 → 한 번에 대량 송금")
     print("=" * 60)
 
-    # 사기/중립 계좌에서 S3로 소액 입금 (정상 계좌는 수금 피해 제외)
-    collectors = [accts[5], accts[6], accts[8], accts[9], accts[5], accts[6]]
+    # 사기/중립 계좌에서 S3로 소액 입금 (정상 계좌·중립E 제외, 중립F는 포함하여 의심 패턴 유지)
+    collectors = [accts[5], accts[6], accts[9], accts[5], accts[6], accts[9]]
     for source in collectors:
         amt = round(random.uniform(0.5, 2.0), 4)
         send_eth(w3, source, accts[7], amt, "Collect 소액수집")
@@ -466,16 +466,17 @@ def pattern_neutral(w3, accts):
     print("  중립 패턴: 정상+의심 혼합")
     print("=" * 60)
 
-    # 중립 E [8]: 중립끼리 + 사기 계좌와도 거래 (정상 계좌 오염 최소화)
+    # 중립 E [8]: 중립끼리 위주 거래 + 사기 계좌와 소량만 거래 (임계값 근처 확률이 나오도록 조정)
     send_eth(w3, accts[8], accts[9], 2.0, "중립E→중립F")
-    send_eth(w3, accts[8], accts[5], 4.0, "중립E→사기계좌")
-    send_eth(w3, accts[8], accts[6], 1.5, "중립E→세탁계좌")
-    send_eth(w3, accts[8], accts[9], 1.0, "중립E→중립F")
+    send_eth(w3, accts[8], accts[5], 1.5, "중립E→사기계좌")
+    send_eth(w3, accts[8], accts[9], 2.0, "중립E→중립F")
+    send_eth(w3, accts[8], accts[1], 1.0, "중립E→정상A")
 
-    # 중립 F [9]: 소수 거래 + 의심 계좌와 혼합
+    # 중립 F [9]: 수신 즉시 다른 곳으로 전달하는 패턴 + 의심 계좌와 혼합 (임계값 근처 확률 유도)
     send_eth(w3, accts[9], accts[8], 3.0, "중립F→중립E")
     send_eth(w3, accts[9], accts[6], 2.5, "중립F→세탁계좌")
     send_eth(w3, accts[9], accts[5], 2.0, "중립F→사기계좌")
+    send_eth(w3, accts[9], accts[6], 1.5, "중립F→세탁계좌2")
 
 
 def pattern_escrow_mixed(w3, contract, accts, owner):

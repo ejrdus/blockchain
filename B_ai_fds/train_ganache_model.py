@@ -435,15 +435,15 @@ def generate_neutral_samples(n=150):
     """
     samples = []
     for _ in range(n):
-        # ── 유형 A: 사기계좌와 양방향 거래가 있는 중립 (중립E 유사) ──
-        # 송신도 하고 수신도 활발, 다양한 상대
-        sent_tnx = random.randint(3, 8)
+        # ── 유형 A: 사기계좌와 일부 거래가 있는 중립 (중립E 유사) ──
+        # 송수신 모두 있지만 전체 잔액이 명확히 양수 (Layering과 구분)
+        sent_tnx = random.randint(2, 6)
         recv_tnx = random.randint(3, 10)
-        unique_sent = random.randint(2, min(sent_tnx, 5))
+        unique_sent = random.randint(2, min(sent_tnx, 4))
         unique_recv = random.randint(2, min(recv_tnx, 5))
 
-        avg_sent = random.uniform(1.0, 5.0)
-        avg_recv = random.uniform(1.0, 6.0)
+        avg_sent = random.uniform(1.0, 4.0)
+        avg_recv = random.uniform(1.5, 6.0)   # 수신이 송신보다 많음
         min_sent = avg_sent * random.uniform(0.2, 0.6)
         max_sent = avg_sent * random.uniform(1.5, 3.0)   # 넓은 금액 범위 (사기와 구분)
         min_recv = avg_recv * random.uniform(0.2, 0.6)
@@ -451,8 +451,8 @@ def generate_neutral_samples(n=150):
 
         total_sent = avg_sent * sent_tnx
         total_recv = avg_recv * recv_tnx
-        # 중립은 잔액이 남아있음 (세탁이 아님)
-        balance = total_recv - total_sent + random.uniform(0, 10)
+        # 중립은 잔액이 충분히 남아있음 (세탁이 아님)
+        balance = total_recv - total_sent + random.uniform(3, 12)
 
         samples.append({
             "Avg min between sent tnx": random.uniform(0, 0.3),
@@ -482,6 +482,7 @@ def generate_neutral_samples(n=150):
         })
 
     # ── 유형 B: 수신 위주이지만 소수에게 큰 금액 보내는 중립 (중립F 유사) ──
+    # 잔액이 충분히 남아있어야 Layering과 구분됨 (balance 항상 양수 유지)
     for _ in range(n // 2):
         recv_tnx = random.randint(4, 12)
         sent_tnx = random.randint(2, 5)
@@ -489,10 +490,11 @@ def generate_neutral_samples(n=150):
         unique_sent = random.randint(2, 4)
 
         avg_recv = random.uniform(1.0, 5.0)
-        avg_sent = random.uniform(2.0, 7.0)   # 보내는 금액이 좀 큼
+        avg_sent = random.uniform(1.0, 4.0)   # 보내는 금액이 수신보다 확실히 낮음
         total_recv = avg_recv * recv_tnx
         total_sent = avg_sent * sent_tnx
-        balance = total_recv - total_sent + random.uniform(-3, 8)
+        # 잔액이 충분히 남아있음 (세탁 패턴 아님)
+        balance = total_recv - total_sent + random.uniform(4, 15)
 
         samples.append({
             "Avg min between sent tnx": random.uniform(0, 0.4),
@@ -547,10 +549,102 @@ def add_noise_to_samples(seed_features, n_per_seed=15):
 # 3단계: 학습
 # ═══════════════════════════════════════════════════════════════
 
+def generate_borderline_samples(n=120):
+    """
+    경계선 근처 샘플 — 정상/사기 특징이 혼재하는 애매한 케이스.
+    모델이 중간 확률(30~70%)을 출력하도록 학습시키기 위함.
+    """
+    samples = []
+    # 사기 특징이 일부 있지만 전체적으로 정상에 가까운 케이스 (label=0)
+    for _ in range(n // 2):
+        sent_tnx = random.randint(4, 9)
+        recv_tnx = random.randint(3, 8)
+        unique_sent = random.randint(2, 4)
+        unique_recv = random.randint(2, 4)
+
+        avg_sent = random.uniform(1.0, 4.0)
+        avg_recv = random.uniform(1.0, 4.5)
+        total_sent = avg_sent * sent_tnx
+        total_recv = avg_recv * recv_tnx
+        # 잔액이 약간 있지만 완전히 소진되지는 않음
+        balance = total_recv - total_sent + random.uniform(0.5, 5.0)
+
+        samples.append({
+            "Avg min between sent tnx": random.uniform(0, 0.3),
+            "Avg min between received tnx": random.uniform(0, 0.3),
+            "Time Diff between first and last (Mins)": random.uniform(0, 4),
+            "Sent tnx": sent_tnx,
+            "Received Tnx": recv_tnx,
+            "Unique Received From Addresses": unique_recv,
+            "Unique Sent To Addresses": unique_sent,
+            "min value received": avg_recv * random.uniform(0.3, 0.7),
+            "max value received": avg_recv * random.uniform(1.3, 2.5),
+            "avg val received": avg_recv,
+            "min val sent": avg_sent * random.uniform(0.3, 0.7),
+            "max val sent": avg_sent * random.uniform(1.3, 2.5),
+            "avg val sent": avg_sent,
+            "min value sent to contract": 0,
+            "max val sent to contract": 0,
+            "avg value sent to contract": 0,
+            "total transactions (including tnx to create contract": sent_tnx + recv_tnx,
+            "total Ether sent": total_sent,
+            "total ether received": total_recv,
+            "total ether sent contracts": 0,
+            "total ether balance": balance,
+            "sent_received_ratio": total_sent / (total_recv + 1e-9),
+            "unique_counterparty_ratio": unique_sent / (sent_tnx + 1e-9),
+            "_label": 0,
+        })
+
+    # 사기 특징이 있지만 완전히 전형적이지 않은 케이스 (label=1, 하지만 약한 사기)
+    for _ in range(n // 2):
+        sent_tnx = random.randint(4, 10)
+        recv_tnx = random.randint(3, 8)
+        unique_sent = random.randint(2, 5)
+        unique_recv = random.randint(2, 4)
+
+        avg_sent = random.uniform(1.0, 5.0)
+        avg_recv = random.uniform(1.0, 4.0)
+        total_sent = avg_sent * sent_tnx
+        total_recv = avg_recv * recv_tnx
+        # 잔액이 약간 부족하거나 거의 없음 (세탁 경향)
+        balance = total_recv - total_sent + random.uniform(-2.0, 2.0)
+
+        samples.append({
+            "Avg min between sent tnx": random.uniform(0, 0.2),
+            "Avg min between received tnx": random.uniform(0, 0.2),
+            "Time Diff between first and last (Mins)": random.uniform(0, 3),
+            "Sent tnx": sent_tnx,
+            "Received Tnx": recv_tnx,
+            "Unique Received From Addresses": unique_recv,
+            "Unique Sent To Addresses": unique_sent,
+            "min value received": avg_recv * random.uniform(0.3, 0.7),
+            "max value received": avg_recv * random.uniform(1.3, 2.5),
+            "avg val received": avg_recv,
+            "min val sent": avg_sent * random.uniform(0.3, 0.7),
+            "max val sent": avg_sent * random.uniform(1.3, 2.5),
+            "avg val sent": avg_sent,
+            "min value sent to contract": 0,
+            "max val sent to contract": 0,
+            "avg value sent to contract": 0,
+            "total transactions (including tnx to create contract": sent_tnx + recv_tnx,
+            "total Ether sent": total_sent,
+            "total ether received": total_recv,
+            "total ether sent contracts": 0,
+            "total ether balance": balance,
+            "sent_received_ratio": total_sent / (total_recv + 1e-9),
+            "unique_counterparty_ratio": unique_sent / (sent_tnx + 1e-9),
+            "_label": 1,
+        })
+
+    return samples
+
+
 def train_model(all_data):
-    """LightGBM 모델 학습"""
+    """LightGBM 모델 학습 + Platt Scaling 확률 보정"""
     from lightgbm import LGBMClassifier
     from sklearn.model_selection import cross_val_score
+    from sklearn.calibration import CalibratedClassifierCV
 
     df = pd.DataFrame(all_data)
 
@@ -561,26 +655,27 @@ def train_model(all_data):
     print(f"  정상(0): {(y == 0).sum()}건 / 사기(1): {(y == 1).sum()}건")
     print(f"  Feature 수: {len(TRAIN_FEATURES)}개")
 
-    model = LGBMClassifier(
-        n_estimators=200,
-        max_depth=6,
+    base_model = LGBMClassifier(
+        n_estimators=150,
+        max_depth=4,        # 얕게 → 과적합 방지, 부드러운 확률 분포
         learning_rate=0.05,
-        num_leaves=31,
-        min_child_samples=5,
+        num_leaves=15,      # 축소 → 결정 경계 부드럽게
+        min_child_samples=10,
         class_weight="balanced",
         random_state=42,
         verbose=-1,
     )
 
     # 교차 검증
-    scores = cross_val_score(model, X, y, cv=5, scoring="f1")
+    scores = cross_val_score(base_model, X, y, cv=5, scoring="f1")
     print(f"\n  5-Fold F1 Score: {scores.mean():.4f} (±{scores.std():.4f})")
     print(f"  각 Fold: {[f'{s:.4f}' for s in scores]}")
 
-    # 전체 데이터로 최종 학습
+    # Platt Scaling으로 확률 보정 (0/1로 몰리는 과신뢰 문제 해결)
+    model = CalibratedClassifierCV(base_model, method="sigmoid", cv=5)
     model.fit(X, y)
 
-    # 최적 임계값 찾기 (정밀도-재현율 균형)
+    # 최적 임계값 찾기 (보정된 확률 기준)
     probas = model.predict_proba(X)[:, 1]
 
     best_threshold = 0.5
@@ -600,12 +695,10 @@ def train_model(all_data):
     print(f"\n  최적 임계값: {best_threshold:.2f}")
     print(f"  최적 F1: {best_f1:.4f}")
 
-    # Feature importance 출력
-    importances = model.feature_importances_
-    feat_imp = sorted(zip(TRAIN_FEATURES, importances), key=lambda x: -x[1])
-    print("\n  Feature Importance (상위 10):")
-    for fname, imp in feat_imp[:10]:
-        print(f"    {fname:50s} : {imp}")
+    # 확률 분포 확인
+    print(f"\n  확률 분포 (보정 후):")
+    print(f"    정상 계좌 평균: {probas[y == 0].mean():.3f}")
+    print(f"    사기 계좌 평균: {probas[y == 1].mean():.3f}")
 
     return model, best_threshold
 
@@ -660,15 +753,16 @@ def main():
 
     all_data = []
 
-    # 실제 Ganache 데이터 증강
+    # 실제 Ganache 데이터 증강 (n_per_seed 축소 → 합성 데이터 비중 확보)
     if ganache_data:
-        augmented = add_noise_to_samples(ganache_data, n_per_seed=20)
+        augmented = add_noise_to_samples(ganache_data, n_per_seed=8)
         all_data.extend(augmented)
         print(f"  Ganache 증강 데이터: {len(augmented)}건")
 
     # 패턴별 합성 데이터
     normal_samples = generate_normal_samples(300)
     neutral_samples = generate_neutral_samples(200)
+    borderline_samples = generate_borderline_samples(120)   # 경계선 샘플 추가
     smurfing_samples = generate_smurfing_samples(100)
     layering_samples = generate_layering_samples(100)
     draining_samples = generate_draining_samples(80)
@@ -678,6 +772,7 @@ def main():
 
     all_data.extend(normal_samples)
     all_data.extend(neutral_samples)
+    all_data.extend(borderline_samples)
     all_data.extend(smurfing_samples)
     all_data.extend(layering_samples)
     all_data.extend(draining_samples)
@@ -687,6 +782,7 @@ def main():
 
     print(f"  정상 패턴: {len(normal_samples)}건")
     print(f"  중립 패턴: {len(neutral_samples)}건 (정상 라벨)")
+    print(f"  경계선 패턴: {len(borderline_samples)}건 (확률 보정용)")
     print(f"  Smurfing: {len(smurfing_samples)}건")
     print(f"  Layering: {len(layering_samples)}건")
     print(f"  Draining: {len(draining_samples)}건")
