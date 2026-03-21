@@ -32,8 +32,30 @@ sys.path.append(os.path.join(ROOT_DIR, "A_blockchain"))
 sys.path.append(os.path.join(ROOT_DIR, "C_smart_contract"))
 
 from config import GANACHE_URL, FDS_SERVER_URL, FDS_ENDPOINT
+from config import IS_LOCAL_GANACHE, GANACHE_SCALE_FACTORS
 from A_blockchain.read_block import analyze_address
-from C_smart_contract.rule_engine import rule_based_score
+from C_smart_contract.rule_engine import rule_based_score, hybrid_score
+
+
+def scale_ganache_features(features: dict) -> dict:
+    """
+    Ganache feature를 실제 이더리움 스케일로 변환 (Kaggle 모델 대응)
+    각 feature: result = base + value * scale
+    - base : 시간 feature 등 Ganache에서 ≈0인 값에 최소 기반값 부여
+    - scale: 곱셈 스케일 팩터로 계좌 간 차이 증폭
+    """
+    if not IS_LOCAL_GANACHE:
+        return features
+    scaled = {}
+    for k, v in features.items():
+        config = GANACHE_SCALE_FACTORS.get(k)
+        if config is None:
+            scaled[k] = v
+        else:
+            base, scale = config
+            # 원본값이 0이면 base만, 0보다 크면 base + 증폭된 차이
+            scaled[k] = base + v * scale
+    return scaled
 
 DEPLOY_INFO_PATH = os.path.join(ROOT_DIR, "C_smart_contract", "deploy_info.json")
 ABI_PATH = os.path.join(ROOT_DIR, "C_smart_contract", "abi", "Token.json")
@@ -204,11 +226,14 @@ def check_receiver_history(w3, address):
 
 
 def run_ai_check(w3, address):
-    """A파트 feature 추출 + B파트 AI 판별 (100% AI)"""
+    """A파트 feature 추출 + B파트 AI 판별 (AI 기반, 임계값 32%)"""
     try:
         features = analyze_address(w3, address)
     except Exception as e:
-        return None, None, None, str(e)
+        return None, None, None, None, str(e)
+
+    # Ganache → 실 이더리움 스케일 변환
+    scaled_features = scale_ganache_features(features)
 
     # AI 모델 호출
     ai_proba = -1.0
@@ -216,7 +241,7 @@ def run_ai_check(w3, address):
     try:
         res = requests.post(
             FDS_SERVER_URL + FDS_ENDPOINT,
-            json={"features": features},
+            json={"features": scaled_features},
             timeout=10,
         )
         ai_result = res.json()
@@ -227,28 +252,27 @@ def run_ai_check(w3, address):
     # 참고용 패턴 정보
     rule_info = rule_based_score(features)
 
-    # 100% AI 판별 결과 구성
+    # AI 기반 판별 (임계값 32%)
+    THRESHOLD = 32.0
     if ai_proba >= 0:
-        threshold_pct = ai_result.get("threshold", 50)
         final_score = ai_proba
-        is_fraud = ai_proba >= threshold_pct
+        is_fraud = ai_proba >= THRESHOLD
     else:
         # AI 서버 미연결 → 규칙 기반 fallback
         final_score = rule_info["rule_score"]
-        is_fraud = final_score >= 40
-        threshold_pct = 40
+        is_fraud = final_score >= THRESHOLD
 
     result = {
         "final_score": round(final_score, 2),
         "is_fraud": is_fraud,
         "ai_score": round(ai_proba, 2),
-        "threshold": threshold_pct,
+        "threshold": THRESHOLD,
         "detected_patterns": rule_info["detected_patterns"],
         "pattern_scores": {k: round(v, 1) for k, v in rule_info["pattern_scores"].items()},
         "ai_connected": ai_proba >= 0,
     }
 
-    return features, ai_result, result, None
+    return features, scaled_features, ai_result, result, None
 
 
 def execute_escrow(w3, contract, sender, receiver, amount_fdt):
@@ -309,7 +333,7 @@ st.set_page_config(
 )
 
 st.title("🛡️ FDT 블록체인 사기 탐지 시스템")
-st.caption("FraudDetectionToken — 에스크로 기반 AI 사기 탐지 (100% AI 모델)")
+st.caption("FraudDetectionToken — 에스크로 기반 AI 사기 탐지 (Kaggle 이더리움 모델)")
 
 w3, contract, deploy_info = connect()
 accounts = w3.eth.accounts
@@ -451,7 +475,7 @@ with tab2:
 
             # AI 검증 (100% AI)
             with st.spinner("AI 사기 검증 중..."):
-                features, ai_result, result, error = run_ai_check(w3, receiver_addr)
+                features, scaled_features, ai_result, result, error = run_ai_check(w3, receiver_addr)
 
             if error:
                 st.warning(f"검증 실패: {error} — 검증 없이 승인 처리")
@@ -504,10 +528,10 @@ with tab2:
                     )
 
                 # ── SHAP 계산 & CSV 저장 ──
-                if features:
+                if scaled_features:
                     with st.spinner("SHAP 분석 중..."):
                         shap_df = compute_and_save_shap(
-                            features,
+                            scaled_features,
                             sender=sender_addr,
                             receiver=receiver_addr,
                             amount=amount,
@@ -591,12 +615,12 @@ with tab3:
         else:
             # AI 분석 (100% AI)
             with st.spinner("AI 분석 중..."):
-                features, ai_result, result, error = run_ai_check(w3, addr)
+                features, scaled_features, ai_result, result, error = run_ai_check(w3, addr)
 
             if error:
                 st.warning(f"분석 실패: {error}")
             else:
-                mode_label = "AI 100%" if result["ai_connected"] else "규칙 기반 (AI 미연결)"
+                mode_label = "AI 기반" if result["ai_connected"] else "규칙 기반 (AI 미연결)"
                 st.subheader(f"판별 결과 — {mode_label}")
                 col_a1, col_a2, col_a3 = st.columns(3)
                 with col_a1:

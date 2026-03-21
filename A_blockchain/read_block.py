@@ -136,6 +136,7 @@ def analyze_address(w3: Web3, target_address: str) -> dict:
     """
     특정 지갑 주소의 모든 TX를 전수 스캔하여
     B파트 AI 모델에 필요한 feature 딕셔너리를 반환합니다.
+    ETH 직접 전송 + ERC20(FDT) 토큰 Transfer 이벤트 모두 분석합니다.
     """
     target_address = w3.to_checksum_address(target_address)
 
@@ -144,11 +145,17 @@ def analyze_address(w3: Web3, target_address: str) -> dict:
     sent_to_addrs, recv_from_addrs = set(), set()
     sent_to_contract_values = []
 
+    # 블록 타임스탬프 캐시 (ERC20 로그 처리 시 재활용)
+    block_timestamps = {}
+
     latest = w3.eth.block_number
     logger.info(f"주소 분석 시작: {target_address} (블록 0 ~ {latest})")
 
+    # ── 1) ETH 직접 전송 분석 ──
     for num in range(0, latest + 1):
         block = w3.eth.get_block(num, full_transactions=True)
+        block_timestamps[num] = block.timestamp
+
         for tx in block.transactions:
             val = float(w3.from_wei(tx["value"], "ether"))
             ts  = block.timestamp
@@ -160,7 +167,6 @@ def analyze_address(w3: Web3, target_address: str) -> dict:
                 sent_values.append(val)
                 if to:
                     sent_to_addrs.add(to)
-                    # to 주소가 컨트랙트인지 판별 (코드가 있으면 컨트랙트)
                     if w3.eth.get_code(to) != b"":
                         sent_to_contract_values.append(val)
 
@@ -169,6 +175,70 @@ def analyze_address(w3: Web3, target_address: str) -> dict:
                 recv_values.append(val)
                 recv_from_addrs.add(frm)
 
+    # ── 2) ERC20 Transfer 이벤트 분석 ──
+    TRANSFER_TOPIC = w3.keccak(text="Transfer(address,address,uint256)")
+    padded_target = '0x' + target_address[2:].lower().rjust(64, '0')
+
+    erc20_sent_times, erc20_recv_times = [], []
+    erc20_sent_values, erc20_recv_values = [], []
+    erc20_sent_to_addrs = set()
+    erc20_recv_from_addrs = set()
+    erc20_sent_to_contract_values = []
+    erc20_contract_times = []
+    erc20_recv_contract_addrs = set()
+
+    # target이 보낸 ERC20 토큰
+    try:
+        sent_logs = w3.eth.get_logs({
+            'fromBlock': 0,
+            'toBlock': 'latest',
+            'topics': [TRANSFER_TOPIC, padded_target],
+        })
+        for log in sent_logs:
+            to_addr = w3.to_checksum_address('0x' + log['topics'][2].hex()[-40:])
+            raw_data = log['data']
+            if len(raw_data) == 0:
+                value = 0.0
+            else:
+                value = int.from_bytes(raw_data, 'big') / (10 ** 18)
+            ts = block_timestamps.get(log['blockNumber'], 0)
+
+            erc20_sent_times.append(ts)
+            erc20_sent_values.append(value)
+            erc20_sent_to_addrs.add(to_addr)
+
+            if w3.eth.get_code(to_addr) != b"":
+                erc20_sent_to_contract_values.append(value)
+                erc20_contract_times.append(ts)
+    except Exception as e:
+        logger.warning(f"ERC20 sent 로그 조회 실패: {e}")
+
+    # target이 받은 ERC20 토큰
+    try:
+        recv_logs = w3.eth.get_logs({
+            'fromBlock': 0,
+            'toBlock': 'latest',
+            'topics': [TRANSFER_TOPIC, None, padded_target],
+        })
+        for log in recv_logs:
+            from_addr = w3.to_checksum_address('0x' + log['topics'][1].hex()[-40:])
+            raw_data = log['data']
+            if len(raw_data) == 0:
+                value = 0.0
+            else:
+                value = int.from_bytes(raw_data, 'big') / (10 ** 18)
+            ts = block_timestamps.get(log['blockNumber'], 0)
+
+            erc20_recv_times.append(ts)
+            erc20_recv_values.append(value)
+            erc20_recv_from_addrs.add(from_addr)
+
+            if w3.eth.get_code(from_addr) != b"":
+                erc20_recv_contract_addrs.add(from_addr)
+    except Exception as e:
+        logger.warning(f"ERC20 recv 로그 조회 실패: {e}")
+
+    # ── Helper ──
     def avg_gap_min(times):
         sorted_t = sorted(times)
         if len(sorted_t) < 2:
@@ -176,6 +246,7 @@ def analyze_address(w3: Web3, target_address: str) -> dict:
         gaps = [(sorted_t[i+1] - sorted_t[i]) / 60 for i in range(len(sorted_t) - 1)]
         return sum(gaps) / len(gaps)
 
+    # ── ETH 집계 ──
     all_times = sorted(sent_times + recv_times)
     time_diff = (all_times[-1] - all_times[0]) / 60 if len(all_times) >= 2 else 0
 
@@ -183,7 +254,15 @@ def analyze_address(w3: Web3, target_address: str) -> dict:
     total_received = sum(recv_values)
     total_sent_contract = sum(sent_to_contract_values)
 
+    # ── ERC20 집계 ──
+    erc20_total_sent = sum(erc20_sent_values)
+    erc20_total_recv = sum(erc20_recv_values)
+    erc20_total_sent_contract = sum(erc20_sent_to_contract_values)
+    erc20_total_tnxs = len(erc20_sent_times) + len(erc20_recv_times)
+    has_erc20 = 1 if erc20_total_tnxs > 0 else 0
+
     features = {
+        # ── ETH 기본 feature ──
         "Avg min between sent tnx":                    avg_gap_min(sent_times),
         "Avg min between received tnx":                avg_gap_min(recv_times),
         "Time Diff between first and last (Mins)":     time_diff,
@@ -206,33 +285,36 @@ def analyze_address(w3: Web3, target_address: str) -> dict:
         "total ether received":                        total_received,
         "total ether sent contracts":                  total_sent_contract,
         "total ether balance":                         total_received - total_sent,
-        # ERC20 관련 (로컬 Ganache에서는 이벤트 추적 미구현 → 0)
-        "Total ERC20 tnxs":                            0,
-        "ERC20 total Ether received":                  0,
-        "ERC20 total ether sent":                      0,
-        "ERC20 total Ether sent contract":             0,
-        "ERC20 uniq sent addr":                        0,
-        "ERC20 uniq rec addr":                         0,
-        "ERC20 uniq rec contract addr":                0,
-        "ERC20 avg time between sent tnx":             0,
-        "ERC20 avg time between rec tnx":              0,
-        "ERC20 avg time between contract tnx":         0,
-        "ERC20 min val rec":                           0,
-        "ERC20 max val rec":                           0,
-        "ERC20 avg val rec":                           0,
-        "ERC20 min val sent":                          0,
-        "ERC20 max val sent":                          0,
-        "ERC20 avg val sent":                          0,
-        "ERC20 min val sent contract":                 0,
-        "ERC20 max val sent contract":                 0,
-        "ERC20 avg val sent contract":                 0,
-        # 파생 변수
-        "has_erc20_activity":                          0,
+        # ── ERC20 feature (FDT 토큰 Transfer 이벤트 기반) ──
+        "Total ERC20 tnxs":                            erc20_total_tnxs,
+        "ERC20 total Ether received":                  erc20_total_recv,
+        "ERC20 total ether sent":                      erc20_total_sent,
+        "ERC20 total Ether sent contract":             erc20_total_sent_contract,
+        "ERC20 uniq sent addr":                        len(erc20_sent_to_addrs),
+        "ERC20 uniq rec addr":                         len(erc20_recv_from_addrs),
+        "ERC20 uniq rec contract addr":                len(erc20_recv_contract_addrs),
+        "ERC20 avg time between sent tnx":             avg_gap_min(erc20_sent_times),
+        "ERC20 avg time between rec tnx":              avg_gap_min(erc20_recv_times),
+        "ERC20 avg time between contract tnx":         avg_gap_min(erc20_contract_times),
+        "ERC20 min val rec":                           min(erc20_recv_values) if erc20_recv_values else 0,
+        "ERC20 max val rec":                           max(erc20_recv_values) if erc20_recv_values else 0,
+        "ERC20 avg val rec":                           sum(erc20_recv_values) / len(erc20_recv_values) if erc20_recv_values else 0,
+        "ERC20 min val sent":                          min(erc20_sent_values) if erc20_sent_values else 0,
+        "ERC20 max val sent":                          max(erc20_sent_values) if erc20_sent_values else 0,
+        "ERC20 avg val sent":                          sum(erc20_sent_values) / len(erc20_sent_values) if erc20_sent_values else 0,
+        "ERC20 min val sent contract":                 min(erc20_sent_to_contract_values) if erc20_sent_to_contract_values else 0,
+        "ERC20 max val sent contract":                 max(erc20_sent_to_contract_values) if erc20_sent_to_contract_values else 0,
+        "ERC20 avg val sent contract":                 sum(erc20_sent_to_contract_values) / len(erc20_sent_to_contract_values) if erc20_sent_to_contract_values else 0,
+        # ── 파생 변수 ──
+        "has_erc20_activity":                          has_erc20,
         "sent_received_ratio":                         total_sent / (total_received + 1e-9),
         "unique_counterparty_ratio":                   len(sent_to_addrs) / (len(sent_times) + 1e-9),
     }
 
-    logger.info(f"분석 완료: 송신 {len(sent_times)}건 / 수신 {len(recv_times)}건")
+    logger.info(
+        f"분석 완료: ETH 송신 {len(sent_times)}건 / 수신 {len(recv_times)}건 "
+        f"| ERC20 {erc20_total_tnxs}건"
+    )
     return features
 
 
