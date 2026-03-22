@@ -248,8 +248,8 @@ def pattern_smurfing(w3, accts):
     print("  사기 패턴 1: Smurfing (소액 분산 세탁) — 확대")
     print("=" * 60)
 
-    # S1 → 사기/중립 계좌에 소액 분산 (50건)
-    smurfing_targets = [accts[6], accts[7], accts[8], accts[9]]
+    # S1 → 사기/중립E 계좌에 소액 분산 (50건)
+    smurfing_targets = [accts[6], accts[7], accts[8]]
     for _ in range(50):
         target = random.choice(smurfing_targets)
         amt = round(random.uniform(0.1, 0.7), 4)
@@ -316,11 +316,11 @@ def pattern_roundtrip(w3, accts):
     print("  사기 패턴 4: Round-trip (순환 거래) — 확대")
     print("=" * 60)
 
-    # 동일 금액 순환 — 6회
+    # 동일 금액 순환 — 6회 (S1→S3→S2→S1, 중립F 제외)
     for cycle, amt in enumerate([5.0, 5.0, 3.0, 3.0, 4.0, 4.0], 1):
         send_eth(w3, accts[5], accts[7], amt, f"Round-trip 순환{cycle}")
-        send_eth(w3, accts[7], accts[9], amt, f"Round-trip 순환{cycle}")
-        send_eth(w3, accts[9], accts[5], amt, f"Round-trip 순환{cycle}")
+        send_eth(w3, accts[7], accts[6], amt, f"Round-trip 순환{cycle}")
+        send_eth(w3, accts[6], accts[5], amt, f"Round-trip 순환{cycle}")
 
 
 def pattern_dust_probing(w3, accts):
@@ -334,7 +334,7 @@ def pattern_dust_probing(w3, accts):
     print("=" * 60)
 
     # S3 → 다수 주소에 극소액 전송 (40건)
-    dust_targets = [accts[5], accts[6], accts[8], accts[9]]
+    dust_targets = [accts[5], accts[6], accts[8]]
     for _ in range(40):
         target = random.choice(dust_targets)
         amt = round(random.uniform(0.0001, 0.001), 4)
@@ -352,7 +352,7 @@ def pattern_pump_collect(w3, accts):
     print("=" * 60)
 
     # 사기/중립 계좌에서 S3로 소액 입금 (12건)
-    collectors = [accts[5], accts[6], accts[9]]
+    collectors = [accts[5], accts[6]]
     for _ in range(12):
         source = random.choice(collectors)
         amt = round(random.uniform(0.5, 2.5), 4)
@@ -391,19 +391,19 @@ def pattern_neutral(w3, accts):
         send_eth(w3, accts[8], target, amt, "중립E 추가")
 
     # ── 중립 F [9]: 중개 역할 + 의심 계좌 혼합 ──
-    # 정상 상대
-    for _ in range(3):
+    # 정상 상대 (비중 확대)
+    for _ in range(5):
         target = random.choice([accts[1], accts[2], accts[8]])
         amt = round(random.uniform(1.0, 3.0), 4)
         send_eth(w3, accts[9], target, amt, "중립F→정상/중립")
-    # 사기 계좌와 거래
-    for _ in range(4):
-        target = random.choice([accts[5], accts[6], accts[7]])
-        amt = round(random.uniform(1.0, 3.0), 4)
+    # 사기 계좌와 소량 거래 (의심 요소, 비중 축소)
+    for _ in range(2):
+        target = random.choice([accts[5], accts[6]])
+        amt = round(random.uniform(0.5, 1.0), 4)
         send_eth(w3, accts[9], target, amt, "중립F→사기계좌")
-    # 추가 혼합 거래
+    # 추가 정상 거래
     for _ in range(3):
-        target = random.choice([accts[8], accts[1], accts[6]])
+        target = random.choice([accts[8], accts[1], accts[3]])
         amt = round(random.uniform(0.8, 2.5), 4)
         send_eth(w3, accts[9], target, amt, "중립F 추가")
 
@@ -432,7 +432,7 @@ def pattern_escrow_mixed(w3, contract, accts, owner):
     # ── Smurfing 에스크로 (소액 분산 반복) ──
     print("\n  ── Smurfing 에스크로 ──")
     for _ in range(10):
-        target = random.choice([accts[6], accts[7], accts[8], accts[9]])
+        target = random.choice([accts[6], accts[7], accts[8]])
         amt = random.randint(30, 150)
         escrow_txs.append(("fraud", escrow_deposit(w3, contract, accts[5], target, amt, "Smurfing 소액")))
 
@@ -454,7 +454,7 @@ def pattern_escrow_mixed(w3, contract, accts, owner):
     escrow_txs.append(("normal", escrow_deposit(w3, contract, accts[9], accts[8], 800, "중립F→E")))
     escrow_txs.append(("normal", escrow_deposit(w3, contract, accts[8], accts[1], 500, "중립E→정상A")))
     escrow_txs.append(("fraud", escrow_deposit(w3, contract, accts[8], accts[5], 2000, "중립E→사기")))
-    escrow_txs.append(("fraud", escrow_deposit(w3, contract, accts[9], accts[6], 1500, "중립F→사기")))
+    escrow_txs.append(("normal", escrow_deposit(w3, contract, accts[9], accts[1], 1500, "중립F→정상A")))
 
     # ── 승인/거부 처리 ──
     print(f"\n{'─'*60}")
@@ -495,7 +495,7 @@ def pattern_fdt_transfers(w3, contract, accts):
     # ── 사기 S1 (Smurfing FDT) — 소액 분산 ──
     print("\n  ── S1 Smurfing FDT ──")
     for _ in range(15):
-        target = random.choice([accts[6], accts[7], accts[8], accts[9]])
+        target = random.choice([accts[6], accts[7], accts[8]])
         amt = random.randint(20, 200)
         transfer_fdt(w3, contract, accts[5], target, amt, "Smurfing FDT")
 
@@ -503,7 +503,7 @@ def pattern_fdt_transfers(w3, contract, accts):
     print("\n  ── S2 Layering FDT ──")
     # S2 → 다수에게 분산
     for _ in range(10):
-        target = random.choice([accts[5], accts[7], accts[9]])
+        target = random.choice([accts[5], accts[7]])
         amt = random.randint(500, 3000)
         transfer_fdt(w3, contract, accts[6], target, amt, "Layering FDT")
 
@@ -511,7 +511,7 @@ def pattern_fdt_transfers(w3, contract, accts):
     print("\n  ── S3 Dust+Collect FDT ──")
     # 극소액 다수 전송
     for _ in range(10):
-        target = random.choice([accts[5], accts[6], accts[8], accts[9]])
+        target = random.choice([accts[5], accts[6], accts[8]])
         amt = random.randint(1, 10)
         transfer_fdt(w3, contract, accts[7], target, amt, "Dust FDT")
     # 대량 인출
