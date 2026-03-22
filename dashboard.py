@@ -226,49 +226,42 @@ def check_receiver_history(w3, address):
 
 
 def run_ai_check(w3, address):
-    """A파트 feature 추출 + B파트 AI 판별 (AI 기반, 임계값 32%)"""
+    """A파트 feature 추출 + 100% AI 판별 (Ganache 맞춤 모델)"""
     try:
         features = analyze_address(w3, address)
     except Exception as e:
         return None, None, None, None, str(e)
 
-    # Ganache → 실 이더리움 스케일 변환
+    # Ganache 맞춤 모델은 raw feature 그대로 사용 (스케일링 불필요)
+    # SHAP 분석용으로 Kaggle 스케일 변환은 별도 유지
     scaled_features = scale_ganache_features(features)
 
-    # AI 모델 호출
+    # AI 모델 호출 (100% AI)
     ai_proba = -1.0
     ai_result = None
+    threshold_pct = 50.0
     try:
         res = requests.post(
             FDS_SERVER_URL + FDS_ENDPOINT,
-            json={"features": scaled_features},
+            json={"features": features},  # raw features → ganache 모델
             timeout=10,
         )
         ai_result = res.json()
         ai_proba = ai_result["pred_proba"]
+        threshold_pct = ai_result.get("threshold", 50.0)
     except Exception:
-        pass  # AI 서버 미연결 → 규칙 fallback
+        pass
 
-    # 참고용 패턴 정보
-    rule_info = rule_based_score(features)
-
-    # AI 기반 판별 (임계값 32%)
-    THRESHOLD = 32.0
-    if ai_proba >= 0:
-        final_score = ai_proba
-        is_fraud = ai_proba >= THRESHOLD
-    else:
-        # AI 서버 미연결 → 규칙 기반 fallback
-        final_score = rule_info["rule_score"]
-        is_fraud = final_score >= THRESHOLD
+    # 참고용 패턴 분석 (UI 표시용)
+    rule_result = rule_based_score(features)
 
     result = {
-        "final_score": round(final_score, 2),
-        "is_fraud": is_fraud,
+        "final_score": round(ai_proba, 2) if ai_proba >= 0 else 0.0,
+        "is_fraud": ai_proba >= threshold_pct if ai_proba >= 0 else False,
         "ai_score": round(ai_proba, 2),
-        "threshold": THRESHOLD,
-        "detected_patterns": rule_info["detected_patterns"],
-        "pattern_scores": {k: round(v, 1) for k, v in rule_info["pattern_scores"].items()},
+        "threshold": threshold_pct,
+        "detected_patterns": rule_result["detected_patterns"],
+        "pattern_scores": rule_result["pattern_scores"],
         "ai_connected": ai_proba >= 0,
     }
 

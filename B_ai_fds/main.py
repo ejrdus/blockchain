@@ -4,12 +4,13 @@ import os
 # 어디서 실행하든 main.py 기준으로 pkl 파일을 찾도록 절대 경로 사용
 _dir = os.path.dirname(os.path.abspath(__file__))
 
-# 실제 이더리움 데이터(Kaggle) 학습 모델 사용
-# → 자체 시뮬레이션 데이터로 학습 시 순환 검증 문제 발생, 실 데이터 모델이 학술적으로 유효
-real_model_path = os.path.join(_dir, "fraud_model_artifact.pkl")
+# Ganache 환경 맞춤 모델 사용 (100% AI 판별)
+# → 규칙 기반 도메인 지식을 AI에 내재화한 LightGBM 모델
+# → 실 이더리움 모델(Kaggle)은 Ganache feature 분포와 불일치하여 정확도 낮음
+ganache_model_path = os.path.join(_dir, "ganache_model_artifact.pkl")
 
-artifact = joblib.load(real_model_path)
-print(f"[+] 실 이더리움 데이터 모델 로드: {artifact['model_name']}")
+artifact = joblib.load(ganache_model_path)
+print(f"[+] Ganache 맞춤 모델 로드: {artifact['model_name']}")
 
 model = artifact["model"]
 feature_cols = artifact["feature_cols"]

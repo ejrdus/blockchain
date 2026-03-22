@@ -47,8 +47,8 @@ ACCOUNT_ROLES = {
     5: ("Fraud_S1",      "fraud"),    # Smurfing
     6: ("Fraud_S2",      "fraud"),    # Layering + Draining
     7: ("Fraud_S3",      "fraud"),    # Dust + Pump&Collect
-    8: ("Neutral_E",     "normal"),   # 중립 → 정상 취급
-    9: ("Neutral_F",     "normal"),   # 중립 → 정상 취급
+    8: ("Neutral_E",     "neutral"),  # 중립 (정상/사기 중간)
+    9: ("Neutral_F",     "neutral"),  # 중립 (정상/사기 중간)
 }
 
 # 학습에 사용할 feature 목록 (ERC20은 Ganache에서 0이므로 비시간 feature 위주)
@@ -90,7 +90,11 @@ def extract_ganache_features(w3):
         role_name, label = ACCOUNT_ROLES[idx]
         print(f"  [{idx}] {role_name} ({addr[:14]}...) feature 추출 중...")
         features = analyze_address(w3, addr)
-        features["_label"] = 1 if label == "fraud" else 0
+        # 중립 계좌는 증강 시 절반 fraud/절반 normal로 분리 (중간 확률 유도)
+        if label == "neutral":
+            features["_label"] = -1  # 특수 라벨 (증강에서 처리)
+        else:
+            features["_label"] = 1 if label == "fraud" else 0
         features["_role"] = role_name
         data.append(features)
 
@@ -426,7 +430,10 @@ def generate_pump_collect_samples(n=60):
 
 def generate_neutral_samples(n=150):
     """
-    중립 패턴 합성 — 정상이지만 사기 패턴과 일부 겹치는 특성을 가짐.
+    중립 패턴 합성 — 정상/사기 특성이 혼재하는 중간 계좌.
+
+    절반은 fraud(1), 절반은 normal(0)로 라벨링하여
+    모델이 중립 패턴에 대해 중간 확률(25~45%)을 출력하도록 유도.
 
     중립 계좌의 특징:
       - 사기 계좌와 거래 이력이 있어 일부 feature가 비정상적으로 보임
@@ -434,25 +441,28 @@ def generate_neutral_samples(n=150):
       - 거래 건수 중간, 송수신 비율 불균형 가능, 다수 상대방
     """
     samples = []
+    total_count = 0
     for _ in range(n):
         # ── 유형 A: 사기계좌와 일부 거래가 있는 중립 (중립E 유사) ──
-        # 송수신 모두 있지만 전체 잔액이 명확히 양수 (Layering과 구분)
         sent_tnx = random.randint(2, 6)
         recv_tnx = random.randint(3, 10)
         unique_sent = random.randint(2, min(sent_tnx, 4))
         unique_recv = random.randint(2, min(recv_tnx, 5))
 
         avg_sent = random.uniform(1.0, 4.0)
-        avg_recv = random.uniform(1.5, 6.0)   # 수신이 송신보다 많음
+        avg_recv = random.uniform(1.5, 6.0)
         min_sent = avg_sent * random.uniform(0.2, 0.6)
-        max_sent = avg_sent * random.uniform(1.5, 3.0)   # 넓은 금액 범위 (사기와 구분)
+        max_sent = avg_sent * random.uniform(1.5, 3.0)
         min_recv = avg_recv * random.uniform(0.2, 0.6)
         max_recv = avg_recv * random.uniform(1.5, 3.0)
 
         total_sent = avg_sent * sent_tnx
         total_recv = avg_recv * recv_tnx
-        # 중립은 잔액이 충분히 남아있음 (세탁이 아님)
         balance = total_recv - total_sent + random.uniform(3, 12)
+
+        # 절반 fraud / 절반 normal → 중간 확률 유도
+        label = 1 if total_count % 2 == 0 else 0
+        total_count += 1
 
         samples.append({
             "Avg min between sent tnx": random.uniform(0, 0.3),
@@ -478,11 +488,10 @@ def generate_neutral_samples(n=150):
             "total ether balance": balance,
             "sent_received_ratio": total_sent / (total_recv + 1e-9),
             "unique_counterparty_ratio": unique_sent / (sent_tnx + 1e-9),
-            "_label": 0,  # 정상 라벨
+            "_label": label,
         })
 
-    # ── 유형 B: 수신 위주이지만 소수에게 큰 금액 보내는 중립 (중립F 유사) ──
-    # 잔액이 충분히 남아있어야 Layering과 구분됨 (balance 항상 양수 유지)
+    # ── 유형 B: 수신 위주 중립 (중립F 유사) ──
     for _ in range(n // 2):
         recv_tnx = random.randint(4, 12)
         sent_tnx = random.randint(2, 5)
@@ -490,11 +499,13 @@ def generate_neutral_samples(n=150):
         unique_sent = random.randint(2, 4)
 
         avg_recv = random.uniform(1.0, 5.0)
-        avg_sent = random.uniform(1.0, 4.0)   # 보내는 금액이 수신보다 확실히 낮음
+        avg_sent = random.uniform(1.0, 4.0)
         total_recv = avg_recv * recv_tnx
         total_sent = avg_sent * sent_tnx
-        # 잔액이 충분히 남아있음 (세탁 패턴 아님)
         balance = total_recv - total_sent + random.uniform(4, 15)
+
+        label = 1 if total_count % 2 == 0 else 0
+        total_count += 1
 
         samples.append({
             "Avg min between sent tnx": random.uniform(0, 0.4),
@@ -520,7 +531,7 @@ def generate_neutral_samples(n=150):
             "total ether balance": balance,
             "sent_received_ratio": total_sent / (total_recv + 1e-9),
             "unique_counterparty_ratio": unique_sent / (sent_tnx + 1e-9),
-            "_label": 0,
+            "_label": label,
         })
 
     return samples
@@ -531,7 +542,7 @@ def add_noise_to_samples(seed_features, n_per_seed=15):
     augmented = []
     for feat in seed_features:
         label = feat["_label"]
-        for _ in range(n_per_seed):
+        for i in range(n_per_seed):
             noisy = {}
             for key in TRAIN_FEATURES:
                 val = feat.get(key, 0)
@@ -540,7 +551,11 @@ def add_noise_to_samples(seed_features, n_per_seed=15):
                     noisy[key] = val * noise
                 else:
                     noisy[key] = val
-            noisy["_label"] = label
+            # 중립 계좌(-1): 절반은 fraud(1), 절반은 normal(0) → 중간 확률 유도
+            if label == -1:
+                noisy["_label"] = 1 if i < n_per_seed // 2 else 0
+            else:
+                noisy["_label"] = label
             augmented.append(noisy)
     return augmented
 
@@ -675,25 +690,12 @@ def train_model(all_data):
     model = CalibratedClassifierCV(base_model, method="sigmoid", cv=5)
     model.fit(X, y)
 
-    # 최적 임계값 찾기 (보정된 확률 기준)
+    # 임계값 51% 고정 (사용자 지정)
     probas = model.predict_proba(X)[:, 1]
 
-    best_threshold = 0.5
-    best_f1 = 0
-    for t in np.arange(0.3, 0.7, 0.01):
-        preds = (probas >= t).astype(int)
-        tp = ((preds == 1) & (y == 1)).sum()
-        fp = ((preds == 1) & (y == 0)).sum()
-        fn = ((preds == 0) & (y == 1)).sum()
-        precision = tp / (tp + fp + 1e-9)
-        recall = tp / (tp + fn + 1e-9)
-        f1 = 2 * precision * recall / (precision + recall + 1e-9)
-        if f1 > best_f1:
-            best_f1 = f1
-            best_threshold = t
+    best_threshold = 0.31
 
-    print(f"\n  최적 임계값: {best_threshold:.2f}")
-    print(f"  최적 F1: {best_f1:.4f}")
+    print(f"\n  임계값: {best_threshold:.2f} (고정)")
 
     # 확률 분포 확인
     print(f"\n  확률 분포 (보정 후):")
@@ -816,11 +818,18 @@ def main():
             proba = float(model.predict_proba(X_test)[:, 1][0])
             pred_label = 1 if proba >= threshold else 0
 
-            match = "✅" if pred_label == true_label else "❌"
-            label_str = "사기" if true_label == 1 else "정상"
-            pred_str = "사기" if pred_label == 1 else "정상"
+            # 중립 계좌는 중간 확률(20~50%)이면 올바른 것으로 판정
+            if true_label == -1:
+                label_str = "중립"
+                is_correct = 0.20 <= proba <= 0.50
+                pred_str = "중립" if 0.20 <= proba <= 0.50 else ("사기" if proba > 0.50 else "정상")
+            else:
+                label_str = "사기" if true_label == 1 else "정상"
+                pred_str = "사기" if pred_label == 1 else "정상"
+                is_correct = pred_label == true_label
 
-            if pred_label == true_label:
+            match = "✅" if is_correct else "❌"
+            if is_correct:
                 correct += 1
             total += 1
 

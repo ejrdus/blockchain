@@ -141,7 +141,7 @@ def check_receiver_history(w3, address) -> dict:
 
 def ai_verify(w3, address) -> tuple[bool, float, dict]:
     """
-    수신자 이력 확인 → A파트 feature 계산 → B파트 AI 판별 (100% AI).
+    수신자 이력 확인 → A파트 feature 계산 → 100% AI 판별.
     반환: (정상 여부, 사기 확률%, 검증 상세 결과 dict)
     """
     result_detail = {
@@ -161,18 +161,18 @@ def ai_verify(w3, address) -> tuple[bool, float, dict]:
         print(f"\n  {history['warning_message']}")
 
     if history["warning_level"] == "danger":
-        # 이력 전무 → AI 검증 불가, 경고와 함께 보류 처리
         print("  → 거래 이력 없음: AI 검증 불가. 송신자 확인 필요.")
         result_detail["final_decision"] = "hold_no_history"
         return False, -1.0, result_detail
 
     # ── Step B: A파트 feature 추출 ──
-    print(f"\n  [🤖 AI 검증] {address[:10]}... 지갑 분석 중...")
+    print(f"\n  [🤖 검증] {address[:10]}... 지갑 분석 중...")
     features = analyze_address(w3, address)
     result_detail["features"] = features
 
     # ── Step C: B파트 AI 판별 (100% AI) ──
     ai_proba = -1.0
+    threshold_pct = 50.0
     try:
         res = requests.post(
             FDS_SERVER_URL + FDS_ENDPOINT,
@@ -181,35 +181,36 @@ def ai_verify(w3, address) -> tuple[bool, float, dict]:
         )
         ai_result = res.json()
         ai_proba = ai_result["pred_proba"]
+        threshold_pct = ai_result.get("threshold", 50.0)
         result_detail["ai_result"] = ai_result
-        print(f"  [AI 모델] 사기 확률: {ai_proba}%")
+        print(f"  [AI 모델] 사기 확률: {ai_proba}% (임계값: {threshold_pct}%)")
     except requests.exceptions.ConnectionError:
         print("  [!] B파트 FDS 서버 미연결 — AI 판별 불가")
 
-    # ── Step D: 패턴 참조 (보조 정보) ──
-    rule_info = rule_based_score(features)
-    result_detail["rule_info"] = rule_info
-
-    if rule_info["detected_patterns"]:
-        print(f"  [참고 패턴] {', '.join(rule_info['detected_patterns'])}")
-
-    # ── Step E: 최종 판별 (100% AI) ──
+    # ── 100% AI 판별 ──
     if ai_proba < 0:
-        # AI 서버 미연결 → 규칙 기반 fallback
-        final_score = rule_info["rule_score"]
-        print(f"  [Fallback] 규칙 기반 점수: {final_score}%")
-        is_fraud = final_score >= 40
-    else:
-        final_score = ai_proba
-        threshold_pct = ai_result.get("threshold", 50)
-        is_fraud = ai_proba >= threshold_pct
-        print(f"  [최종 점수] {final_score}% (AI 100%, 임계값 {threshold_pct}%)")
+        print("  [!] AI 결과 없음 — 안전을 위해 거부 처리")
+        result_detail["final_decision"] = "rejected"
+        return False, 0.0, result_detail
+
+    is_fraud = ai_proba >= threshold_pct
+    final_score = ai_proba
+
+    # 참고용 패턴 분석 (UI 표시용)
+    rule_result = rule_based_score(features)
+    if rule_result["detected_patterns"]:
+        print(f"  [참고 패턴] {', '.join(rule_result['detected_patterns'])}")
+    result_detail["detected_patterns"] = rule_result["detected_patterns"]
+    result_detail["pattern_scores"] = rule_result["pattern_scores"]
+
+    print(f"  [최종 판별] 사기 확률: {final_score}% (임계값: {threshold_pct}%) → {'사기' if is_fraud else '정상'}")
 
     if history["warning_level"] == "caution":
         print("  ℹ️  이력 부족으로 정확도가 낮을 수 있음")
 
     is_safe = not is_fraud
     result_detail["final_score"] = final_score
+    result_detail["threshold"] = threshold_pct
     result_detail["final_decision"] = "approved" if is_safe else "rejected"
     return is_safe, final_score, result_detail
 
